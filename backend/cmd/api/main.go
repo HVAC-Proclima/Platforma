@@ -3105,10 +3105,15 @@ WHERE id = $1
 		_, _ = w.Write([]byte(fmt.Sprintf("%d,%q,,,,,%.2f\n", clientID, "TOTAL", total)))
 	})))
 
-	addr := ":8080"
+	port := os.Getenv("PORT")
+	if port == "" {
+	    port = "8080"
+	}
+	addr := "0.0.0.0:" + port
+	
 	log.Printf("API listening on %s", addr)
 	if err := http.ListenAndServe(addr, withCORS(mux)); err != nil {
-		log.Fatal(err)
+	    log.Fatal(err)
 	}
 }
 
