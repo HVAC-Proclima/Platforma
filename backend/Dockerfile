@@ -25,4 +25,4 @@ COPY --from=builder /app/migrations /app/migrations
 
 EXPOSE 8080
 
-CMD ["/app/migrate", "&&", "/app/server"]
+CMD ["/app/server"]
