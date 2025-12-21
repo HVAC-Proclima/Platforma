@@ -1,17 +1,17 @@
 # -------- build stage --------
 FROM golang:1.24 AS builder
 
-WORKDIR /app
+WORKDIR /src
 
-# 1) deps first (cache-friendly)
-COPY go.mod go.sum ./
-RUN go mod download
+# deps first (cache-friendly)
+COPY backend/go.mod backend/go.sum ./backend/
+RUN cd backend && go mod download
 
-# 2) copy source
-COPY . .
+# copy backend source
+COPY backend ./backend
 
-# 3) build (main.go is in repo root)
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server .
+# build API binary (cmd/api)
+RUN cd backend && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/api
 
 # -------- runtime stage --------
 FROM gcr.io/distroless/static-debian12
@@ -19,8 +19,7 @@ FROM gcr.io/distroless/static-debian12
 WORKDIR /app
 
 COPY --from=builder /out/server /app/server
-# keep migrations available for MIGRATE_ON_START=1 (your main.go uses "migrations")
-COPY --from=builder /app/migrations /app/migrations
+COPY --from=builder /src/backend/migrations /app/migrations
 
 EXPOSE 8080
 
