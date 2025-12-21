@@ -1,0 +1,3205 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
+)
+
+type ctxKey string
+
+const DefaultStockLocationCode = "ZOR"
+const ctxUserKey ctxKey = "user"
+
+var defaultStockLocationID int64
+
+var materialsHasCategory bool
+
+var usersHasEmail bool
+
+type UserClaims struct {
+	UserID int64  `json:"user_id"`
+	Name   string `json:"name"`
+	Role   string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+type LoginRequest struct {
+	Phone    string `json:"phone"`
+	Password string `json:"password"`
+}
+
+type LoginResponse struct {
+	Token string `json:"token"`
+	User  struct {
+		UserID int64  `json:"user_id"`
+		Name   string `json:"name"`
+		Role   string `json:"role"`
+	} `json:"user"`
+}
+
+type CreateClientRequest struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"` // "PF" sau "PJ"
+	CNP     string `json:"cnp,omitempty"`
+	CUI     string `json:"cui,omitempty"`
+	Phone   string `json:"phone,omitempty"`
+	Email   string `json:"email,omitempty"`
+	Address string `json:"address,omitempty"`
+	Notes   string `json:"notes,omitempty"`
+}
+
+type CreateClientResponse struct {
+	ID int64 `json:"id"`
+}
+
+type UpdateClientRequest struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"` // "PF" sau "PJ"
+	CNP     string `json:"cnp,omitempty"`
+	CUI     string `json:"cui,omitempty"`
+	Phone   string `json:"phone,omitempty"`
+	Email   string `json:"email,omitempty"`
+	Address string `json:"address,omitempty"`
+	Note    string `json:"note,omitempty"`
+	Notes   string `json:"notes,omitempty"` // backward compat
+}
+
+type ClientListItem struct {
+	ID      int64  `json:"id"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Phone   string `json:"phone,omitempty"`
+	CNP     string `json:"cnp,omitempty"`
+	CUI     string `json:"cui,omitempty"`
+	Address string `json:"address,omitempty"`
+}
+
+type CreateWorkerRequest struct {
+	Name  string `json:"name"`
+	Phone string `json:"phone,omitempty"`
+	Notes string `json:"notes,omitempty"`
+}
+
+type CreateUserRequest struct {
+	Name     string `json:"name"`
+	Phone    string `json:"phone"`
+	Email    string `json:"email,omitempty"` // optional; may not be persisted depending on DB schema
+	Role     string `json:"role,omitempty"`
+	Active   *bool  `json:"active,omitempty"`
+	Password string `json:"password,omitempty"` // required on create; optional on reset
+}
+
+type UpdateUserRequest struct {
+	Name     *string `json:"name,omitempty"`
+	Phone    *string `json:"phone,omitempty"`
+	Email    *string `json:"email,omitempty"` // optional; may not be persisted depending on DB schema
+	Role     *string `json:"role,omitempty"`
+	Active   *bool   `json:"active,omitempty"`
+	Password *string `json:"password,omitempty"`
+}
+
+type UserListItem struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Phone     string `json:"phone,omitempty"`
+	Email     string `json:"email,omitempty"`
+	Role      string `json:"role,omitempty"`
+	Active    bool   `json:"active"`
+	LastLogin string `json:"last_login_at,omitempty"`
+}
+
+type UpdateWorkerRequest struct {
+	Name   *string `json:"name,omitempty"`
+	Phone  *string `json:"phone,omitempty"`
+	Notes  *string `json:"notes,omitempty"`
+	Active *bool   `json:"active,omitempty"`
+}
+
+type WorkerListItem struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Phone  string `json:"phone,omitempty"`
+	Active bool   `json:"active"`
+}
+
+type CreateProjectRequest struct {
+	Title   string `json:"title"`
+	Address string `json:"address,omitempty"`
+	Notes   string `json:"notes,omitempty"`
+}
+
+type ProjectListItem struct {
+	ID        int64  `json:"id"`
+	Title     string `json:"title"`
+	Status    string `json:"status"`
+	Address   string `json:"address,omitempty"`
+	CreatedAt string `json:"created_at"`
+}
+
+type AssignWorkersRequest struct {
+	WorkerIDs []int64 `json:"worker_ids"`
+	Note      string  `json:"note,omitempty"`
+}
+
+type UpdateProjectStatusRequest struct {
+	Status string `json:"status"`
+}
+
+type CreateMaterialRequest struct {
+	Name     string  `json:"name"`
+	SKU      string  `json:"sku,omitempty"`
+	Unit     string  `json:"unit,omitempty"`
+	Price    float64 `json:"price,omitempty"`
+	MinStock float64 `json:"min_stock,omitempty"`
+	Category string  `json:"category,omitempty"`
+}
+
+type UpdateMaterialRequest struct {
+	Name     *string  `json:"name,omitempty"`
+	SKU      *string  `json:"sku,omitempty"`
+	Unit     *string  `json:"unit,omitempty"`
+	Price    *float64 `json:"price,omitempty"`
+	Active   *bool    `json:"active,omitempty"`
+	Category *string  `json:"category,omitempty"` // frontend may send; ignored if DB doesn't have column
+}
+
+type MaterialListItem struct {
+	ID       int64   `json:"id"`
+	Name     string  `json:"name"`
+	SKU      string  `json:"sku,omitempty"`
+	Unit     string  `json:"unit"`
+	Price    float64 `json:"price,omitempty"`
+	Category string  `json:"category,omitempty"`
+	Active   bool    `json:"active"`
+}
+
+func detectMaterialsColumns(ctx context.Context, db *pgxpool.Pool) {
+	// Optional columns (schema may differ between environments).
+	// Used for non-critical fields required by the frontend.
+	var hasCat bool
+	_ = db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'materials'
+			  AND column_name = 'category'
+		)
+	`).Scan(&hasCat)
+	materialsHasCategory = hasCat
+}
+
+func detectUsersColumns(ctx context.Context, db *pgxpool.Pool) {
+	var hasEmail bool
+	_ = db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'users'
+			  AND column_name = 'email'
+		)
+	`).Scan(&hasEmail)
+	usersHasEmail = hasEmail
+}
+
+func ensureStockMovementsCheck(ctx context.Context, db *pgxpool.Pool) {
+	// Relax stock_movements_check to allow stock adjustments (CONSUM without project_id).
+	// Existing code uses CONSUM with project_id for project consumption; we also use CONSUM with NULL project_id
+	// for location-only adjustments from the Stock screen.
+	if _, err := db.Exec(ctx, `ALTER TABLE stock_movements DROP CONSTRAINT IF EXISTS stock_movements_check`); err != nil {
+		// If the table doesn't exist or we don't have permissions, keep running with the existing schema.
+		log.Printf("warning: cannot drop stock_movements_check: %v", err)
+		return
+	}
+
+	_, err := db.Exec(ctx, `
+		ALTER TABLE stock_movements
+		ADD CONSTRAINT stock_movements_check CHECK (
+			(type = 'IN' AND from_location_id IS NULL AND to_location_id IS NOT NULL AND project_id IS NULL AND qty > 0)
+			OR
+			(type = 'TRANSFER' AND from_location_id IS NOT NULL AND to_location_id IS NOT NULL AND project_id IS NULL AND qty > 0)
+			OR
+			(type = 'CONSUM' AND from_location_id IS NOT NULL AND to_location_id IS NULL AND qty > 0)
+			OR
+			(type = 'RETURN' AND from_location_id IS NULL AND to_location_id IS NOT NULL AND qty > 0)
+		)
+	`)
+	if err != nil {
+		log.Printf("warning: cannot add stock_movements_check: %v", err)
+	}
+}
+
+func ensureUsersRoleCheckAllowsUser(ctx context.Context, db *pgxpool.Pool) {
+	// Some DBs ship with users.role CHECK constraint that doesn't include 'user'.
+	// The frontend (Users.jsx) uses role: "user" by default.
+	// We expand the existing constraint (if present) to include 'user' while preserving other allowed roles.
+	var def string
+	err := db.QueryRow(ctx, `
+SELECT pg_get_constraintdef(c.oid)
+FROM pg_constraint c
+JOIN pg_class t ON t.oid = c.conrelid
+WHERE c.conname = 'users_role_check' AND t.relname = 'users'
+`).Scan(&def)
+	if err != nil {
+		return
+	}
+	if strings.Contains(def, "'user'") {
+		return
+	}
+	re := regexp.MustCompile(`'([^']+)'`)
+	matches := re.FindAllStringSubmatch(def, -1)
+	if len(matches) == 0 {
+		return
+	}
+	seen := map[string]bool{}
+	roles := make([]string, 0, len(matches)+1)
+	for _, mm := range matches {
+		r := mm[1]
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		roles = append(roles, r)
+	}
+	if !seen["user"] {
+		roles = append(roles, "user")
+	}
+	// rebuild constraint
+	vals := make([]string, 0, len(roles))
+	for _, r := range roles {
+		vals = append(vals, fmt.Sprintf("'%s'", strings.ReplaceAll(r, "'", "''")))
+	}
+	_, _ = db.Exec(ctx, "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check")
+	_, _ = db.Exec(ctx, fmt.Sprintf("ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN (%s))", strings.Join(vals, ",")))
+}
+
+type StockInRequest struct {
+	MaterialID   int64    `json:"material_id"`
+	ToLocation   int64    `json:"to_location_id,omitempty"`
+	LocationCode string   `json:"location_code,omitempty"` // "ZOR"/"IRS" (opțional)
+	Qty          float64  `json:"qty"`
+	UnitPrice    *float64 `json:"unit_price,omitempty"` // snapshot (opțional)
+	Note         string   `json:"note,omitempty"`
+}
+
+type StockConsumeRequest struct {
+	ProjectID    int64   `json:"project_id"`
+	MaterialID   int64   `json:"material_id"`
+	FromLocation int64   `json:"from_location_id,omitempty"` // default: Zorilor
+	Qty          float64 `json:"qty"`
+	UnitPrice    float64 `json:"unit_price,omitempty"` // snapshot opțional; dacă lipsește, luăm materials.price
+	Note         string  `json:"note,omitempty"`
+}
+
+type StockTransferRequest struct {
+	MaterialID   int64   `json:"material_id"`
+	Qty          float64 `json:"qty"`
+	ToLocationID int64   `json:"to_location_id"` // Iris
+	Note         string  `json:"note,omitempty"`
+}
+
+// StockAdjustRequest: setare absolută a stocului (qty) pentru un material într-o locație.
+// Frontend (Stock.jsx): POST /stock/adjust {material_id, location_id, qty, note?}
+type StockAdjustRequest struct {
+	MaterialID int64   `json:"material_id"`
+	LocationID int64   `json:"location_id"`
+	Qty        float64 `json:"qty"`
+	Note       string  `json:"note,omitempty"`
+}
+
+type StockImportRow struct {
+	Name     string  `json:"name"`
+	SKU      string  `json:"sku,omitempty"`
+	Unit     string  `json:"unit,omitempty"`
+	Price    float64 `json:"price,omitempty"`
+	Qty      float64 `json:"qty"`
+	Category string  `json:"category,omitempty"`
+}
+
+type StockImportRequest struct {
+	LocationCode string           `json:"location_code"`
+	Rows         []StockImportRow `json:"rows"`
+}
+
+func nullIfEmpty(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return s
+}
+
+func main() {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL not set")
+	}
+
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		log.Fatal("JWT_SECRET not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	db, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("unable to create db pool: %v", err)
+	}
+	defer db.Close()
+
+	// Detect optional columns used by the frontend (keeps API compatible across schemas).
+	ctxCols, cancelCols := context.WithTimeout(context.Background(), 2*time.Second)
+	detectMaterialsColumns(ctxCols, db)
+	detectUsersColumns(ctxCols, db)
+	cancelCols()
+
+	if err := db.Ping(ctx); err != nil {
+		log.Fatalf("unable to connect to database: %v", err)
+	}
+	log.Println("Connected to PostgreSQL")
+
+	// Ensure stock_movements_check allows CONSUM without project_id (used by Stock edit/delete).
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		ensureStockMovementsCheck(ctx, db)
+	}
+
+	// Ensure users_role_check allows role = 'user' (used by Users create flow).
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		ensureUsersRoleCheckAllowsUser(ctx, db)
+	}
+
+	// load default stock location (Zorilor)
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := db.QueryRow(ctx,
+			`SELECT id FROM locations WHERE code = $1 AND active = TRUE`,
+			DefaultStockLocationCode,
+		).Scan(&defaultStockLocationID); err != nil {
+			log.Fatalf("cannot load default stock location %s: %v", DefaultStockLocationCode, err)
+		}
+		log.Printf("Default stock location: %s (id=%d)", DefaultStockLocationCode, defaultStockLocationID)
+	}
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "ok",
+			"db":     "connected",
+		})
+	})
+
+	// LOGIN
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req LoginRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if req.Phone == "" || req.Password == "" {
+			http.Error(w, "phone and password required", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		var (
+			id           int64
+			name         string
+			role         string
+			passwordHash string
+			active       bool
+		)
+
+		err := db.QueryRow(ctx, `
+SELECT id, name, role, password_hash, active
+FROM users
+WHERE phone = $1
+`, req.Phone).Scan(&id, &name, &role, &passwordHash, &active)
+
+		if err != nil || !active {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+
+		if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+
+		_, _ = db.Exec(ctx, `UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1`, id)
+
+		token, err := signJWT(jwtSecret, UserClaims{
+			UserID: id,
+			Name:   name,
+			Role:   role,
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+				IssuedAt:  jwt.NewNumericDate(time.Now()),
+			},
+		})
+		if err != nil {
+			http.Error(w, "token error", http.StatusInternalServerError)
+			return
+		}
+
+		var resp LoginResponse
+		resp.Token = token
+		resp.User.UserID = id
+		resp.User.Name = name
+		resp.User.Role = role
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	// PROTECTED: /me
+	mux.Handle("/me", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		// Enrich /me with phone/email from DB so frontend can display them.
+		var phone string
+		email := ""
+		if usersHasEmail {
+			var em pgtype.Text
+			err := db.QueryRow(ctx, `SELECT phone, email FROM users WHERE id = $1`, claims.UserID).Scan(&phone, &em)
+			if err == nil && em.Valid {
+				email = em.String
+			}
+			if err != nil {
+				// Fall back to claims when DB read fails (keeps auth working)
+				phone = ""
+			}
+		} else {
+			_ = db.QueryRow(ctx, `SELECT phone FROM users WHERE id = $1`, claims.UserID).Scan(&phone)
+		}
+
+		resp := map[string]any{
+			"user_id": claims.UserID,
+			"name":    claims.Name,
+			"role":    claims.Role,
+			"phone":   phone,
+		}
+		if usersHasEmail {
+			resp["email"] = email
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})))
+
+	// /users: GET (admin only) list/search + POST (admin only) create
+	mux.Handle("/users", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+		if claims.Role != "admin" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		switch r.Method {
+
+		case http.MethodPost:
+			var req CreateUserRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+
+			req.Name = strings.TrimSpace(req.Name)
+			req.Phone = strings.TrimSpace(req.Phone)
+			req.Role = strings.TrimSpace(req.Role)
+			req.Email = strings.TrimSpace(req.Email)
+			req.Password = strings.TrimSpace(req.Password)
+
+			if req.Name == "" {
+				http.Error(w, "name required", http.StatusBadRequest)
+				return
+			}
+			if req.Phone == "" {
+				http.Error(w, "phone required", http.StatusBadRequest)
+				return
+			}
+			if req.Password == "" {
+				http.Error(w, "password required", http.StatusBadRequest)
+				return
+			}
+
+			role := req.Role
+			if role == "" {
+				role = "user"
+			}
+
+			active := true
+			if req.Active != nil {
+				active = *req.Active
+			}
+
+			hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+			if err != nil {
+				http.Error(w, "hash failed", http.StatusInternalServerError)
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			var id int64
+			if usersHasEmail {
+				err = db.QueryRow(ctx, `
+INSERT INTO users (name, phone, email, role, password_hash, active)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id
+`, req.Name, req.Phone, nullIfEmpty(req.Email), role, string(hash), active).Scan(&id)
+			} else {
+				err = db.QueryRow(ctx, `
+INSERT INTO users (name, phone, role, password_hash, active)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id
+`, req.Name, req.Phone, role, string(hash), active).Scan(&id)
+			}
+			if err != nil {
+				// Surface DB constraint errors (e.g. duplicate phone) for easier debugging
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr != nil {
+					if pgErr.Code == "23505" {
+						http.Error(w, "phone already exists", http.StatusBadRequest)
+						return
+					}
+					http.Error(w, "insert failed: "+pgErr.Message, http.StatusBadRequest)
+					return
+				}
+				http.Error(w, "insert failed: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			// Return the full user object (frontend expects it)
+			resp := UserListItem{ID: id, Name: req.Name, Phone: req.Phone, Email: req.Email, Role: role, Active: active}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+
+		case http.MethodGet:
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			status := strings.TrimSpace(r.URL.Query().Get("status")) // optional: ACTIVE/INACTIVE
+			roleQ := strings.TrimSpace(r.URL.Query().Get("role"))    // optional: exact role
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			query := ""
+			if usersHasEmail {
+				query = `
+SELECT id, name, phone, email, role, active, last_login_at
+FROM users
+WHERE 1=1
+`
+			} else {
+				query = `
+SELECT id, name, phone, role, active, last_login_at
+FROM users
+WHERE 1=1
+`
+			}
+
+			args := []any{}
+			argN := 0
+
+			if strings.EqualFold(status, "ACTIVE") {
+				query += ` AND active = TRUE`
+			} else if strings.EqualFold(status, "INACTIVE") {
+				query += ` AND active = FALSE`
+			}
+
+			if roleQ != "" && !strings.EqualFold(roleQ, "ALL") {
+				argN++
+				query += fmt.Sprintf(` AND role = $%d`, argN)
+				args = append(args, roleQ)
+			}
+
+			if q != "" {
+				argN++
+				query += fmt.Sprintf(`
+AND (
+  name ILIKE '%%' || $%d || '%%'
+  OR phone ILIKE '%%' || $%d || '%%'
+  OR role ILIKE '%%' || $%d || '%%'
+)
+`, argN, argN, argN)
+				args = append(args, q)
+			}
+
+			query += ` ORDER BY name`
+
+			rows, err := db.Query(ctx, query, args...)
+			if err != nil {
+				http.Error(w, "query failed", http.StatusInternalServerError)
+				return
+			}
+			defer rows.Close()
+
+			out := []UserListItem{}
+			for rows.Next() {
+				var (
+					u   UserListItem
+					lla pgtype.Timestamptz
+				)
+				if usersHasEmail {
+					if err := rows.Scan(&u.ID, &u.Name, &u.Phone, &u.Email, &u.Role, &u.Active, &lla); err != nil {
+						http.Error(w, "scan failed", http.StatusInternalServerError)
+						return
+					}
+				} else {
+					if err := rows.Scan(&u.ID, &u.Name, &u.Phone, &u.Role, &u.Active, &lla); err != nil {
+						http.Error(w, "scan failed", http.StatusInternalServerError)
+						return
+					}
+				}
+				if lla.Valid {
+					u.LastLogin = lla.Time.Format(time.RFC3339)
+				}
+				out = append(out, u)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+			return
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	})))
+
+	// /users/{id}: PATCH (admin only) edit / activate / deactivate + DELETE (admin only) soft delete
+	mux.Handle("/users/", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+		if claims.Role != "admin" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		path := strings.Trim(r.URL.Path, "/")
+		parts := strings.Split(path, "/")
+		if len(parts) != 2 || parts[0] != "users" {
+			http.NotFound(w, r)
+			return
+		}
+		userID, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || userID <= 0 {
+			http.Error(w, "bad id", http.StatusBadRequest)
+			return
+		}
+
+		switch r.Method {
+
+		case http.MethodPatch:
+			var req UpdateUserRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+
+			set := []string{}
+			args := []any{}
+			argN := 0
+
+			if req.Name != nil {
+				name := strings.TrimSpace(*req.Name)
+				if name == "" {
+					http.Error(w, "name required", http.StatusBadRequest)
+					return
+				}
+				argN++
+				set = append(set, fmt.Sprintf("name = $%d", argN))
+				args = append(args, name)
+			}
+
+			if req.Phone != nil {
+				phone := strings.TrimSpace(*req.Phone)
+				if phone == "" {
+					http.Error(w, "phone required", http.StatusBadRequest)
+					return
+				}
+				argN++
+				set = append(set, fmt.Sprintf("phone = $%d", argN))
+				args = append(args, phone)
+			}
+
+			if usersHasEmail && req.Email != nil {
+				email := strings.TrimSpace(*req.Email)
+				argN++
+				set = append(set, fmt.Sprintf("email = $%d", argN))
+				// store NULL when empty to avoid check constraints
+				args = append(args, nullIfEmpty(email))
+			}
+			if req.Role != nil {
+				role := strings.TrimSpace(*req.Role)
+				if role == "" {
+					http.Error(w, "role required", http.StatusBadRequest)
+					return
+				}
+				argN++
+				set = append(set, fmt.Sprintf("role = $%d", argN))
+				args = append(args, role)
+			}
+
+			if req.Password != nil {
+				pass := strings.TrimSpace(*req.Password)
+				if pass == "" {
+					http.Error(w, "password required", http.StatusBadRequest)
+					return
+				}
+				hash, err := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
+				if err != nil {
+					http.Error(w, "hash failed", http.StatusInternalServerError)
+					return
+				}
+				argN++
+				set = append(set, fmt.Sprintf("password_hash = $%d", argN))
+				args = append(args, string(hash))
+			}
+
+			if req.Active != nil {
+				argN++
+				set = append(set, fmt.Sprintf("active = $%d", argN))
+				args = append(args, *req.Active)
+			}
+
+			if len(set) == 0 {
+				http.Error(w, "no changes", http.StatusBadRequest)
+				return
+			}
+
+			argN++
+			args = append(args, userID)
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			q := fmt.Sprintf("UPDATE users SET %s, updated_at = NOW() WHERE id = $%d", strings.Join(set, ", "), argN)
+			tag, err := db.Exec(ctx, q, args...)
+			if err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr != nil {
+					if pgErr.Code == "23505" {
+						http.Error(w, "duplicate value", http.StatusBadRequest)
+						return
+					}
+					http.Error(w, "update failed: "+pgErr.Message, http.StatusBadRequest)
+					return
+				}
+				http.Error(w, "update failed", http.StatusBadRequest)
+				return
+			}
+			if tag.RowsAffected() == 0 {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			// Return full updated object (frontend expects it)
+			var (
+				name     string
+				phone    string
+				reqEmail string
+				role     string
+				active   bool
+				lla      pgtype.Timestamptz
+			)
+			if usersHasEmail {
+				err = db.QueryRow(ctx, `SELECT name, phone, email, role, active, last_login_at FROM users WHERE id = $1`, userID).Scan(&name, &phone, &reqEmail, &role, &active, &lla)
+			} else {
+				err = db.QueryRow(ctx, `SELECT name, phone, role, active, last_login_at FROM users WHERE id = $1`, userID).Scan(&name, &phone, &role, &active, &lla)
+			}
+
+			if err != nil {
+				http.Error(w, "readback failed", http.StatusInternalServerError)
+				return
+			}
+			resp := UserListItem{ID: userID, Name: name, Phone: phone, Role: role, Active: active}
+			if usersHasEmail {
+				resp.Email = reqEmail
+			}
+			if lla.Valid {
+				resp.LastLogin = lla.Time.Format(time.RFC3339)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+
+		case http.MethodDelete:
+			// Soft delete: mark inactive and change phone to avoid unique conflicts.
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				http.Error(w, "tx begin failed", http.StatusInternalServerError)
+				return
+			}
+			defer tx.Rollback(ctx)
+
+			var phone string
+			err = tx.QueryRow(ctx, `SELECT phone FROM users WHERE id = $1`, userID).Scan(&phone)
+			if err != nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			newPhone := fmt.Sprintf("%s_deleted_%d_%d", phone, userID, time.Now().Unix())
+
+			tag, err := tx.Exec(ctx, `
+UPDATE users
+SET active = FALSE,
+	phone = $2,
+	updated_at = NOW()
+WHERE id = $1
+`, userID, newPhone)
+			if err != nil {
+				http.Error(w, "delete failed", http.StatusBadRequest)
+				return
+			}
+			if tag.RowsAffected() == 0 {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			if err := tx.Commit(ctx); err != nil {
+				http.Error(w, "tx commit failed", http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+			return
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	})))
+	// /clients: GET (admin+employee) + POST (admin only)
+	mux.Handle("/clients", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		switch r.Method {
+
+		case http.MethodPost:
+			// admin-only
+			if claims.Role != "admin" {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+
+			var req CreateClientRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+
+			req.Name = strings.TrimSpace(req.Name)
+			req.Type = strings.TrimSpace(req.Type)
+
+			if req.Name == "" {
+				http.Error(w, "name required", http.StatusBadRequest)
+				return
+			}
+			if req.Type != "PF" && req.Type != "PJ" {
+				http.Error(w, "type must be PF or PJ", http.StatusBadRequest)
+				return
+			}
+			if strings.TrimSpace(req.CNP) != "" && strings.TrimSpace(req.CUI) != "" {
+				http.Error(w, "cnp and cui cannot both be set", http.StatusBadRequest)
+				return
+			}
+
+			notes := strings.TrimSpace(req.Notes)
+			if notes == "" {
+				notes = strings.TrimSpace(req.Notes)
+			}
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			var id int64
+			err := db.QueryRow(ctx, `
+	INSERT INTO clients (name, type, cnp, cui, phone, email, address, notes)
+	VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''))
+	RETURNING id
+	`, req.Name, req.Type, req.CNP, req.CUI, req.Phone, req.Email, req.Address, notes).Scan(&id)
+
+			if err != nil {
+				http.Error(w, "insert failed", http.StatusBadRequest)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(CreateClientResponse{ID: id})
+			return
+
+		case http.MethodGet:
+			// list/search (admin+employee)
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			query := `
+	SELECT id, name, type, phone, cnp, cui, address
+	FROM clients
+	WHERE archived = FALSE
+	`
+			args := []any{}
+			if q != "" {
+				query += `
+	AND (
+	  name ILIKE '%' || $1 || '%'
+	  OR phone ILIKE '%' || $1 || '%'
+	  OR cnp ILIKE '%' || $1 || '%'
+	  OR cui ILIKE '%' || $1 || '%'
+	)
+	`
+				args = append(args, q)
+			}
+
+			query += ` ORDER BY name LIMIT 20`
+
+			rows, err := db.Query(ctx, query, args...)
+			if err != nil {
+				http.Error(w, "query failed", http.StatusInternalServerError)
+				return
+			}
+			defer rows.Close()
+
+			var out []ClientListItem
+			for rows.Next() {
+				var (
+					id      int64
+					name    string
+					ctype   string
+					phone   pgtype.Text
+					cnp     pgtype.Text
+					cui     pgtype.Text
+					address pgtype.Text
+				)
+
+				if err := rows.Scan(&id, &name, &ctype, &phone, &cnp, &cui, &address); err != nil {
+					http.Error(w, "scan failed", http.StatusInternalServerError)
+					return
+				}
+
+				c := ClientListItem{
+					ID:   id,
+					Name: name,
+					Type: ctype,
+				}
+				if phone.Valid {
+					c.Phone = phone.String
+				}
+				if cnp.Valid {
+					c.CNP = cnp.String
+				}
+				if cui.Valid {
+					c.CUI = cui.String
+				}
+				if address.Valid {
+					c.Address = address.String
+				}
+
+				out = append(out, c)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+			return
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	})))
+
+	// /clients/{id} - details (admin + employee)
+	// /clients/... (details + projects)
+	mux.Handle("/clients/", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.Trim(r.URL.Path, "/")
+		parts := strings.Split(path, "/")
+
+		// așteptăm cel puțin: clients/{id}
+		if len(parts) < 2 || parts[0] != "clients" {
+			http.NotFound(w, r)
+			return
+		}
+
+		clientID, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || clientID <= 0 {
+			http.Error(w, "invalid client id", http.StatusBadRequest)
+			return
+		}
+
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		// CASE 1: /clients/{id}
+		if len(parts) == 2 {
+
+			switch r.Method {
+
+			case http.MethodGet:
+				// handled below (details)
+
+			case http.MethodPatch:
+				// edit client (admin + employee)
+				var req UpdateClientRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					http.Error(w, "invalid json", http.StatusBadRequest)
+					return
+				}
+
+				req.Name = strings.TrimSpace(req.Name)
+				req.Type = strings.TrimSpace(req.Type)
+				req.CNP = strings.TrimSpace(req.CNP)
+				req.CUI = strings.TrimSpace(req.CUI)
+				req.Phone = strings.TrimSpace(req.Phone)
+				req.Email = strings.TrimSpace(req.Email)
+				req.Address = strings.TrimSpace(req.Address)
+				req.Note = strings.TrimSpace(req.Note)
+				req.Notes = strings.TrimSpace(req.Notes)
+
+				if req.Name == "" {
+					http.Error(w, "name required", http.StatusBadRequest)
+					return
+				}
+				if req.Type != "PF" && req.Type != "PJ" {
+					http.Error(w, "type must be PF or PJ", http.StatusBadRequest)
+					return
+				}
+				if req.CNP != "" && req.CUI != "" {
+					http.Error(w, "cnp and cui cannot both be set", http.StatusBadRequest)
+					return
+				}
+
+				notes := req.Notes
+				if notes == "" {
+					notes = req.Note
+				}
+
+				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				defer cancel()
+
+				tag, err := db.Exec(ctx, `
+	UPDATE clients
+	SET name = $2,
+		type = $3,
+		cnp = NULLIF($4,''),
+		cui = NULLIF($5,''),
+		phone = NULLIF($6,''),
+		email = NULLIF($7,''),
+		address = NULLIF($8,''),
+		notes = NULLIF($9,''),
+		updated_at = NOW()
+	WHERE id = $1 AND archived = FALSE
+	`, clientID, req.Name, req.Type, req.CNP, req.CUI, req.Phone, req.Email, req.Address, notes)
+				if err != nil {
+					http.Error(w, "update failed", http.StatusBadRequest)
+					return
+				}
+				if tag.RowsAffected() == 0 {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": clientID})
+				return
+
+			case http.MethodDelete:
+				// fallback delete from frontend: soft-deactivate
+				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				defer cancel()
+
+				tag, err := db.Exec(ctx, `UPDATE clients SET archived = TRUE, updated_at = NOW() WHERE id = $1 AND archived = FALSE`, clientID)
+				if err != nil {
+					http.Error(w, "delete failed", http.StatusBadRequest)
+					return
+				}
+				if tag.RowsAffected() == 0 {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": clientID})
+				return
+
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			var (
+				name    string
+				ctype   string
+				phone   pgtype.Text
+				email   pgtype.Text
+				cnp     pgtype.Text
+				cui     pgtype.Text
+				address pgtype.Text
+				notes   pgtype.Text
+			)
+
+			err = db.QueryRow(ctx, `
+	SELECT name, type, phone, email, cnp, cui, address, notes
+	FROM clients
+	WHERE id = $1 AND archived = FALSE
+	`, clientID).Scan(&name, &ctype, &phone, &email, &cnp, &cui, &address, &notes)
+
+			if err != nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			resp := map[string]any{
+				"id":   clientID,
+				"name": name,
+				"type": ctype,
+			}
+			if phone.Valid {
+				resp["phone"] = phone.String
+			}
+			if email.Valid {
+				resp["email"] = email.String
+			}
+			if cnp.Valid {
+				resp["cnp"] = cnp.String
+			}
+			if cui.Valid {
+				resp["cui"] = cui.String
+			}
+			if address.Valid {
+				resp["address"] = address.String
+			}
+			if notes.Valid {
+				resp["notes"] = notes.String
+				resp["note"] = notes.String
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// CASE 1b: /clients/{id}/deactivate  (soft deactivate)
+		if len(parts) == 3 && parts[2] == "deactivate" {
+			if r.Method != http.MethodPatch {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			// admin + employee
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			tag, err := db.Exec(ctx, `UPDATE clients SET archived = TRUE, updated_at = NOW() WHERE id = $1 AND archived = FALSE`, clientID)
+			if err != nil {
+				http.Error(w, "deactivate failed", http.StatusBadRequest)
+				return
+			}
+			if tag.RowsAffected() == 0 {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": clientID})
+			return
+		}
+
+		// CASE 2: /clients/{id}/projects
+		if len(parts) == 3 && parts[2] == "projects" {
+			switch r.Method {
+
+			case http.MethodPost:
+				// admin-only
+				if claims.Role != "admin" {
+					http.Error(w, "forbidden", http.StatusForbidden)
+					return
+				}
+
+				var req CreateProjectRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					http.Error(w, "invalid json", http.StatusBadRequest)
+					return
+				}
+
+				req.Title = strings.TrimSpace(req.Title)
+				req.Address = strings.TrimSpace(req.Address)
+				req.Notes = strings.TrimSpace(req.Notes)
+
+				if req.Title == "" {
+					http.Error(w, "title required", http.StatusBadRequest)
+					return
+				}
+
+				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				defer cancel()
+
+				var id int64
+				err = db.QueryRow(ctx, `
+	INSERT INTO projects (client_id, title, address, notes)
+	VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''))
+	RETURNING id
+	`, clientID, req.Title, req.Address, req.Notes).Scan(&id)
+
+				if err != nil {
+					http.Error(w, "insert failed", http.StatusBadRequest)
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
+				return
+
+			case http.MethodGet:
+				// admin + employee
+				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				defer cancel()
+
+				rows, err := db.Query(ctx, `
+	SELECT id, title, status, address, created_at
+	FROM projects
+	WHERE client_id = $1 AND archived = FALSE
+	ORDER BY created_at DESC
+	`, clientID)
+				if err != nil {
+					http.Error(w, "query failed", http.StatusInternalServerError)
+					return
+				}
+				defer rows.Close()
+
+				var out []ProjectListItem
+				for rows.Next() {
+					var (
+						p       ProjectListItem
+						addr    pgtype.Text
+						created time.Time
+					)
+					if err := rows.Scan(&p.ID, &p.Title, &p.Status, &addr, &created); err != nil {
+						http.Error(w, "scan failed", http.StatusInternalServerError)
+						return
+					}
+					if addr.Valid {
+						p.Address = addr.String
+					}
+					p.CreatedAt = created.Format(time.RFC3339)
+					out = append(out, p)
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(out)
+				return
+
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+		}
+
+		// CASE 3: /clients/{id}/report
+		if len(parts) == 3 && parts[2] == "report" {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			defer cancel()
+
+			// 1) client basic
+			var clientName string
+			err := db.QueryRow(ctx, `SELECT name FROM clients WHERE id = $1 AND archived = FALSE`, clientID).Scan(&clientName)
+			if err != nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			// 2) lucrări + cost per lucrare
+			rows, err := db.Query(ctx, `
+		SELECT
+		p.id,
+		p.title,
+		p.status,
+		p.created_at,
+		COALESCE(SUM(sm.qty * COALESCE(sm.unit_price_snapshot, 0)), 0) AS cost
+		FROM projects p
+		LEFT JOIN stock_movements sm
+		ON sm.project_id = p.id AND sm.type = 'CONSUM'
+		WHERE p.client_id = $1 AND p.archived = FALSE
+		GROUP BY p.id, p.title, p.status, p.created_at
+		ORDER BY p.created_at DESC
+		`, clientID)
+			if err != nil {
+				http.Error(w, "query failed", http.StatusInternalServerError)
+				return
+			}
+			defer rows.Close()
+
+			type Item struct {
+				ProjectID int64   `json:"project_id"`
+				Title     string  `json:"title"`
+				Status    string  `json:"status"`
+				CreatedAt string  `json:"created_at"`
+				Cost      float64 `json:"cost"`
+			}
+
+			var (
+				items []Item
+				total float64
+			)
+
+			for rows.Next() {
+				var (
+					it      Item
+					created time.Time
+					cost    pgtype.Numeric
+				)
+				if err := rows.Scan(&it.ProjectID, &it.Title, &it.Status, &created, &cost); err != nil {
+					http.Error(w, "scan failed", http.StatusInternalServerError)
+					return
+				}
+				it.CreatedAt = created.Format(time.RFC3339)
+				if cost.Valid {
+					f, err := cost.Float64Value()
+					if err == nil && f.Valid {
+						it.Cost = f.Float64
+					}
+				}
+				total += it.Cost
+				items = append(items, it)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"client_id":   clientID,
+				"client_name": clientName,
+				"projects":    items,
+				"total_cost":  total,
+			})
+			return
+		}
+
+		// altceva sub /clients/... nu există încă
+		http.NotFound(w, r)
+	})))
+
+	// /workers: GET (admin+employee) + POST (admin only)
+	mux.Handle("/workers", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		switch r.Method {
+
+		case http.MethodPost:
+			// admin-only
+			if claims.Role != "admin" {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+
+			var req CreateWorkerRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+
+			req.Name = strings.TrimSpace(req.Name)
+			req.Phone = strings.TrimSpace(req.Phone)
+			req.Notes = strings.TrimSpace(req.Notes)
+
+			if req.Name == "" {
+				http.Error(w, "name required", http.StatusBadRequest)
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			var id int64
+			err := db.QueryRow(ctx, `
+	INSERT INTO workers (name, phone, notes)
+	VALUES ($1, NULLIF($2,''), NULLIF($3,''))
+	RETURNING id
+	`, req.Name, req.Phone, req.Notes).Scan(&id)
+
+			if err != nil {
+				http.Error(w, "insert failed", http.StatusBadRequest)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
+			return
+
+		case http.MethodGet:
+			// list/search (admin+employee)
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			query := `
+	SELECT id, name, phone, active
+	FROM workers
+	WHERE 1=1
+	`
+			args := []any{}
+			if q != "" {
+				query += `
+	AND (
+	  name ILIKE '%' || $1 || '%'
+	  OR phone ILIKE '%' || $1 || '%'
+	)
+	`
+				args = append(args, q)
+			}
+
+			query += ` ORDER BY name LIMIT 20`
+
+			rows, err := db.Query(ctx, query, args...)
+			if err != nil {
+				http.Error(w, "query failed", http.StatusInternalServerError)
+				return
+			}
+			defer rows.Close()
+
+			var out []WorkerListItem
+			for rows.Next() {
+				var (
+					id     int64
+					name   string
+					phone  pgtype.Text
+					active bool
+				)
+				if err := rows.Scan(&id, &name, &phone, &active); err != nil {
+					http.Error(w, "scan failed", http.StatusInternalServerError)
+					return
+				}
+
+				item := WorkerListItem{ID: id, Name: name, Active: active}
+				if phone.Valid {
+					item.Phone = phone.String
+				}
+				out = append(out, item)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+			return
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	})))
+
+	// /workers/{id}: PATCH (admin only) edit / activate / deactivate + DELETE (admin only) soft delete
+	mux.Handle("/workers/", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+		if claims.Role != "admin" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		path := strings.Trim(r.URL.Path, "/")
+		parts := strings.Split(path, "/")
+		if len(parts) != 2 || parts[0] != "workers" {
+			http.NotFound(w, r)
+			return
+		}
+		workerID, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || workerID <= 0 {
+			http.Error(w, "bad id", http.StatusBadRequest)
+			return
+		}
+
+		switch r.Method {
+
+		case http.MethodPatch:
+			var req UpdateWorkerRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+
+			set := []string{}
+			args := []any{}
+			argN := 0
+
+			if req.Name != nil {
+				name := strings.TrimSpace(*req.Name)
+				if name == "" {
+					http.Error(w, "name required", http.StatusBadRequest)
+					return
+				}
+				argN++
+				set = append(set, fmt.Sprintf("name = $%d", argN))
+				args = append(args, name)
+			}
+			if req.Phone != nil {
+				phone := strings.TrimSpace(*req.Phone)
+				argN++
+				set = append(set, fmt.Sprintf("phone = NULLIF($%d,'')", argN))
+				args = append(args, phone)
+			}
+			if req.Notes != nil {
+				notes := strings.TrimSpace(*req.Notes)
+				argN++
+				set = append(set, fmt.Sprintf("notes = NULLIF($%d,'')", argN))
+				args = append(args, notes)
+			}
+			if req.Active != nil {
+				argN++
+				set = append(set, fmt.Sprintf("active = $%d", argN))
+				args = append(args, *req.Active)
+			}
+
+			if len(set) == 0 {
+				http.Error(w, "no changes", http.StatusBadRequest)
+				return
+			}
+
+			argN++
+			args = append(args, workerID)
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			sql := fmt.Sprintf(`
+	UPDATE workers
+	SET %s, updated_at = NOW()
+	WHERE id = $%d
+	`, strings.Join(set, ", "), argN)
+
+			tag, err := db.Exec(ctx, sql, args...)
+			if err != nil {
+				http.Error(w, "update failed", http.StatusInternalServerError)
+				return
+			}
+			if tag.RowsAffected() == 0 {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": workerID})
+			return
+
+		case http.MethodDelete:
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			tag, err := db.Exec(ctx, `
+	UPDATE workers
+	SET active = FALSE, updated_at = NOW()
+	WHERE id = $1
+	`, workerID)
+
+			if err != nil {
+				http.Error(w, "delete failed", http.StatusInternalServerError)
+				return
+			}
+			if tag.RowsAffected() == 0 {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": workerID})
+			return
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	})))
+
+	// /projects/{id}/workers  (assign + list)
+	mux.Handle("/projects/", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.Trim(r.URL.Path, "/")
+		parts := strings.Split(path, "/")
+
+		// așteptăm: projects/{id}/workers
+		if len(parts) != 3 || parts[0] != "projects" || (parts[2] != "workers" && parts[2] != "status") {
+			http.NotFound(w, r)
+			return
+		}
+
+		projectID, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || projectID <= 0 {
+			http.Error(w, "invalid project id", http.StatusBadRequest)
+			return
+		}
+
+		// route switch
+		if parts[2] == "status" {
+			if r.Method != http.MethodPatch {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+
+			var req UpdateProjectStatusRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+			req.Status = strings.TrimSpace(req.Status)
+
+			switch req.Status {
+			case "planned", "in_progress", "done", "canceled":
+			default:
+				http.Error(w, "invalid status", http.StatusBadRequest)
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			tag, err := db.Exec(ctx, `
+		UPDATE projects
+		SET status = $1, updated_at = NOW()
+		WHERE id = $2 AND archived = FALSE
+		`, req.Status, projectID)
+
+			if err != nil {
+				http.Error(w, "update failed", http.StatusInternalServerError)
+				return
+			}
+			if tag.RowsAffected() == 0 {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "status": req.Status})
+			return
+		}
+
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		switch r.Method {
+
+		case http.MethodPost:
+			// admin-only
+			if claims.Role != "admin" {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+
+			var req AssignWorkersRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+
+			if len(req.WorkerIDs) == 0 {
+				http.Error(w, "worker_ids required", http.StatusBadRequest)
+				return
+			}
+			req.Note = strings.TrimSpace(req.Note)
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			// insert many, ignore duplicates
+			for _, wid := range req.WorkerIDs {
+				if wid <= 0 {
+					continue
+				}
+				_, err := db.Exec(ctx, `
+	INSERT INTO project_workers (project_id, worker_id, note)
+	VALUES ($1,$2,NULLIF($3,''))
+	ON CONFLICT (project_id, worker_id) DO UPDATE SET note = EXCLUDED.note
+	`, projectID, wid, req.Note)
+				if err != nil {
+					http.Error(w, "assign failed", http.StatusBadRequest)
+					return
+				}
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+			return
+
+		case http.MethodGet:
+			// admin + employee
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			rows, err := db.Query(ctx, `
+	SELECT w.id, w.name, w.phone, w.active, pw.note, pw.added_at
+	FROM project_workers pw
+	JOIN workers w ON w.id = pw.worker_id
+	WHERE pw.project_id = $1
+	ORDER BY w.name
+	`, projectID)
+			if err != nil {
+				http.Error(w, "query failed", http.StatusInternalServerError)
+				return
+			}
+			defer rows.Close()
+
+			type Item struct {
+				ID      int64  `json:"id"`
+				Name    string `json:"name"`
+				Phone   string `json:"phone,omitempty"`
+				Active  bool   `json:"active"`
+				Note    string `json:"note,omitempty"`
+				AddedAt string `json:"added_at"`
+			}
+
+			var out []Item
+			for rows.Next() {
+				var (
+					it      Item
+					phone   pgtype.Text
+					note    pgtype.Text
+					addedAt time.Time
+				)
+				if err := rows.Scan(&it.ID, &it.Name, &phone, &it.Active, &note, &addedAt); err != nil {
+					http.Error(w, "scan failed", http.StatusInternalServerError)
+					return
+				}
+				if phone.Valid {
+					it.Phone = phone.String
+				}
+				if note.Valid {
+					it.Note = note.String
+				}
+				it.AddedAt = addedAt.Format(time.RFC3339)
+				out = append(out, it)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+			return
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	})))
+
+	// /materials: GET (admin+employee) + POST (admin+employee create-only)
+	mux.Handle("/materials", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+
+		case http.MethodPost:
+			var req CreateMaterialRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+
+			req.Name = strings.TrimSpace(req.Name)
+			req.SKU = strings.TrimSpace(req.SKU)
+			req.Unit = strings.TrimSpace(req.Unit)
+
+			if req.Name == "" {
+				http.Error(w, "name required", http.StatusBadRequest)
+				return
+			}
+			if req.Unit == "" {
+				req.Unit = "buc"
+			}
+
+			ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+			defer cancel()
+
+			id, created, err := upsertMaterial(ctx, db, req.Name, req.SKU, req.Unit, req.Price, req.MinStock, req.Category)
+			if err != nil {
+				http.Error(w, "upsert failed", http.StatusBadRequest)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":      id,
+				"created": created,
+			})
+			return
+
+		case http.MethodGet:
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+
+			query := ""
+			if materialsHasCategory {
+				query = `
+	SELECT id, name, sku, unit, price, COALESCE(category,'') AS category, active
+	FROM materials
+	WHERE active = TRUE
+	`
+			} else {
+				query = `
+	SELECT id, name, sku, unit, price, '' AS category, active
+	FROM materials
+	WHERE active = TRUE
+	`
+			}
+			args := []any{}
+			if q != "" {
+				query += `
+	AND (
+	name ILIKE '%' || $1 || '%'
+	OR sku ILIKE '%' || $1 || '%'
+	)
+	`
+				args = append(args, q)
+			}
+
+			query += ` ORDER BY name LIMIT 20`
+
+			rows, err := db.Query(ctx, query, args...)
+			if err != nil {
+				http.Error(w, "query failed", http.StatusInternalServerError)
+				return
+			}
+			defer rows.Close()
+
+			var out []MaterialListItem
+			for rows.Next() {
+				var (
+					m      MaterialListItem
+					sku    pgtype.Text
+					price  pgtype.Numeric
+					cat    pgtype.Text
+					active bool
+				)
+
+				if err := rows.Scan(&m.ID, &m.Name, &sku, &m.Unit, &price, &cat, &active); err != nil {
+					http.Error(w, "scan failed", http.StatusInternalServerError)
+					return
+				}
+
+				if sku.Valid {
+					m.SKU = sku.String
+				}
+
+				if cat.Valid {
+					m.Category = cat.String
+				}
+				m.Active = active
+
+				if price.Valid {
+					f, err := price.Float64Value()
+					if err == nil {
+						m.Price = f.Float64
+					}
+				}
+
+				out = append(out, m)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+			return
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	})))
+
+	// GET /locations (admin + employee)
+
+	// /materials/{id}: PATCH (admin+employee) edit / deactivate (soft delete)
+	mux.Handle("/materials/", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		path := strings.Trim(r.URL.Path, "/")
+		parts := strings.Split(path, "/")
+		if len(parts) != 2 || parts[0] != "materials" {
+			http.NotFound(w, r)
+			return
+		}
+
+		materialID, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || materialID <= 0 {
+			http.Error(w, "invalid material id", http.StatusBadRequest)
+			return
+		}
+
+		var req UpdateMaterialRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		set := make([]string, 0, 6)
+		args := []any{materialID}
+		argN := 1
+
+		if req.Name != nil {
+			name := strings.TrimSpace(*req.Name)
+			if name == "" {
+				http.Error(w, "name required", http.StatusBadRequest)
+				return
+			}
+			argN++
+			set = append(set, fmt.Sprintf("name = $%d", argN))
+			args = append(args, name)
+		}
+
+		if req.SKU != nil {
+			sku := strings.TrimSpace(*req.SKU)
+			argN++
+			set = append(set, fmt.Sprintf("sku = NULLIF($%d,'')", argN))
+			args = append(args, sku)
+		}
+
+		if req.Unit != nil {
+			unit := strings.TrimSpace(*req.Unit)
+			if unit == "" {
+				unit = "buc"
+			}
+			argN++
+			set = append(set, fmt.Sprintf("unit = $%d", argN))
+			args = append(args, unit)
+		}
+
+		if req.Price != nil {
+			argN++
+			set = append(set, fmt.Sprintf("price = NULLIF(ROUND($%d::numeric,2),0)", argN))
+			args = append(args, *req.Price)
+		}
+
+		if materialsHasCategory && req.Category != nil {
+			argN++
+			set = append(set, fmt.Sprintf("category = NULLIF($%d,'')", argN))
+			args = append(args, strings.TrimSpace(*req.Category))
+		}
+
+		if req.Active != nil {
+			argN++
+			set = append(set, fmt.Sprintf("active = $%d", argN))
+			args = append(args, *req.Active)
+		}
+
+		if len(set) == 0 {
+			http.Error(w, "no fields to update", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+
+		sql := "UPDATE materials SET " + strings.Join(set, ", ") + ", updated_at = NOW() WHERE id = $1"
+		tag, err := db.Exec(ctx, sql, args...)
+		if err != nil {
+			http.Error(w, "update failed", http.StatusBadRequest)
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": materialID})
+	})))
+
+	mux.Handle("/locations", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		rows, err := db.Query(ctx, `SELECT id, code, name, active FROM locations ORDER BY name`)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		type Item struct {
+			ID     int64  `json:"id"`
+			Code   string `json:"code"`
+			Name   string `json:"name"`
+			Active bool   `json:"active"`
+		}
+
+		var out []Item
+		for rows.Next() {
+			var it Item
+			if err := rows.Scan(&it.ID, &it.Code, &it.Name, &it.Active); err != nil {
+				http.Error(w, "scan failed", http.StatusInternalServerError)
+				return
+			}
+			out = append(out, it)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	})))
+
+	// POST /stock/in  (admin + employee)
+
+	// POST /stock/import  (admin + employee) - import stoc (poate crea materiale dacă lipsesc)
+	mux.Handle("/stock/import", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		var req StockImportRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		req.LocationCode = strings.TrimSpace(req.LocationCode)
+		if req.LocationCode == "" {
+			req.LocationCode = DefaultStockLocationCode
+		}
+		if len(req.Rows) == 0 {
+			http.Error(w, "rows required", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+
+		var locationID int64
+		if err := db.QueryRow(ctx, `SELECT id FROM locations WHERE code=$1 AND active=TRUE`, req.LocationCode).Scan(&locationID); err != nil {
+			http.Error(w, "invalid location_code", http.StatusBadRequest)
+			return
+		}
+
+		createdCount := 0
+		matchedCount := 0
+		movementsAdded := 0
+
+		type RowResult struct {
+			RowIndex   int     `json:"row_index"`
+			MaterialID int64   `json:"material_id"`
+			Name       string  `json:"name"`
+			SKU        string  `json:"sku,omitempty"`
+			Unit       string  `json:"unit"`
+			Qty        float64 `json:"qty"`
+			Created    bool    `json:"created"`
+		}
+		var results []RowResult
+
+		for i, row := range req.Rows {
+			row.Name = strings.TrimSpace(row.Name)
+			row.SKU = strings.TrimSpace(row.SKU)
+			row.Unit = strings.TrimSpace(row.Unit)
+
+			if row.Name == "" || row.Qty <= 0 {
+				continue
+			}
+			if row.Unit == "" {
+				row.Unit = "buc"
+			}
+
+			mid, created, err := upsertMaterial(ctx, db, row.Name, row.SKU, row.Unit, row.Price, 0, row.Category)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("row %d: material upsert failed", i+1), http.StatusBadRequest)
+				return
+			}
+
+			if created {
+				createdCount++
+			} else {
+				matchedCount++
+			}
+
+			// price snapshot for movement
+			unitPrice := row.Price
+			if unitPrice <= 0 {
+				var p pgtype.Numeric
+				_ = db.QueryRow(ctx, `SELECT price FROM materials WHERE id=$1`, mid).Scan(&p)
+				if p.Valid {
+					if f, err := p.Float64Value(); err == nil && f.Valid {
+						unitPrice = f.Float64
+					}
+				}
+			}
+
+			_, err = db.Exec(ctx, `
+			INSERT INTO stock_movements
+			(material_id, type, from_location_id, to_location_id, project_id, qty, unit_price_snapshot, created_by_user_id, note)
+			VALUES
+			($1, 'IN', NULL, $2, NULL, $3, $4, $5, 'import')
+		`, mid, locationID, row.Qty, unitPrice, claims.UserID)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("row %d: stock insert failed", i+1), http.StatusBadRequest)
+				return
+			}
+			movementsAdded++
+
+			results = append(results, RowResult{
+				RowIndex:   i + 1,
+				MaterialID: mid,
+				Name:       row.Name,
+				SKU:        row.SKU,
+				Unit:       row.Unit,
+				Qty:        row.Qty,
+				Created:    created,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":                    true,
+			"location_code":         req.LocationCode,
+			"materials_created":     createdCount,
+			"materials_matched":     matchedCount,
+			"stock_movements_added": movementsAdded,
+			"items":                 results,
+		})
+	})))
+
+	mux.Handle("/stock/in", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		var req StockInRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		if req.MaterialID <= 0 || req.Qty <= 0 {
+			http.Error(w, "material_id and qty required", http.StatusBadRequest)
+			return
+		}
+		req.Note = strings.TrimSpace(req.Note)
+
+		toLocationID := defaultStockLocationID // default: Zorilor
+
+		// 1) dacă vine to_location_id, îl respectăm
+		if req.ToLocation > 0 {
+			toLocationID = req.ToLocation
+		} else {
+			// 2) altfel dacă vine location_code, îl rezolvăm în DB
+			code := strings.ToUpper(strings.TrimSpace(req.LocationCode))
+			if code != "" {
+				if err := db.QueryRow(r.Context(),
+					`SELECT id FROM locations WHERE code=$1 AND active=TRUE`,
+					code,
+				).Scan(&toLocationID); err != nil {
+					http.Error(w, "invalid location_code", http.StatusBadRequest)
+					return
+				}
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		_, err := db.Exec(ctx, `
+	INSERT INTO stock_movements
+	(material_id, type, from_location_id, to_location_id, project_id, qty, unit_price_snapshot, created_by_user_id, note)
+	VALUES
+	($1, 'IN', NULL, $2, NULL, $3, $4, $5, NULLIF($6,''))
+	`, req.MaterialID, toLocationID, req.Qty, req.UnitPrice, claims.UserID, req.Note)
+
+		if err != nil {
+			http.Error(w, "insert failed", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})))
+
+	// POST /stock/adjust (admin + employee) - setare absolută qty pentru un material într-o locație
+	// Folosim ledger-ul existent: dacă trebuie să creștem => inserăm IN; dacă trebuie să scădem => inserăm CONSUM (fără project_id).
+	mux.Handle("/stock/adjust", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		var req StockAdjustRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		if req.MaterialID <= 0 || req.LocationID <= 0 {
+			http.Error(w, "material_id and location_id required", http.StatusBadRequest)
+			return
+		}
+		if req.Qty < 0 {
+			http.Error(w, "qty must be >= 0", http.StatusBadRequest)
+			return
+		}
+		req.Note = strings.TrimSpace(req.Note)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+
+		// validăm locația
+		var locOK bool
+		if err := db.QueryRow(ctx, `SELECT TRUE FROM locations WHERE id=$1 AND active=TRUE`, req.LocationID).Scan(&locOK); err != nil {
+			http.Error(w, "invalid location_id", http.StatusBadRequest)
+			return
+		}
+		// validăm materialul
+		var matOK bool
+		if err := db.QueryRow(ctx, `SELECT TRUE FROM materials WHERE id=$1 AND active=TRUE`, req.MaterialID).Scan(&matOK); err != nil {
+			http.Error(w, "invalid material_id", http.StatusBadRequest)
+			return
+		}
+
+		// price snapshot (unit_price_snapshot) - folosim materials.price
+		unitPrice := 0.0
+		{
+			var p pgtype.Numeric
+			if err := db.QueryRow(ctx, `SELECT price FROM materials WHERE id=$1`, req.MaterialID).Scan(&p); err == nil {
+				if f, err := p.Float64Value(); err == nil && f.Valid {
+					unitPrice = f.Float64
+				}
+			}
+		}
+
+		current, err := getStockQty(ctx, db, req.MaterialID, req.LocationID)
+		if err != nil {
+			http.Error(w, "stock check failed", http.StatusInternalServerError)
+			return
+		}
+
+		diff := req.Qty - current
+		// nimic de făcut
+		if diff > -0.0000001 && diff < 0.0000001 {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "unchanged": true})
+			return
+		}
+
+		if diff > 0 {
+			// IN către locația cerută
+			_, err = db.Exec(ctx, `
+	INSERT INTO stock_movements
+	(material_id, type, from_location_id, to_location_id, project_id, qty, unit_price_snapshot, created_by_user_id, note)
+	VALUES
+	($1, 'IN', NULL, $2, NULL, $3, $4, $5, NULLIF($6,''))
+	`, req.MaterialID, req.LocationID, diff, unitPrice, claims.UserID, req.Note)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("insert failed: %v", err), http.StatusBadRequest)
+				return
+			}
+		} else {
+			// CONSUM din locația cerută (fără project_id)
+			consumeQty := -diff
+			available := current
+			if available < consumeQty {
+				http.Error(w, "insufficient stock", http.StatusBadRequest)
+				return
+			}
+			_, err = db.Exec(ctx, `
+	INSERT INTO stock_movements
+	(material_id, type, from_location_id, to_location_id, project_id, qty, unit_price_snapshot, created_by_user_id, note)
+	VALUES
+	($1, 'CONSUM', $2, NULL, NULL, $3, $4, $5, NULLIF($6,''))
+	`, req.MaterialID, req.LocationID, consumeQty, unitPrice, claims.UserID, req.Note)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("insert failed: %v", err), http.StatusBadRequest)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})))
+
+	// GET /stock (admin + employee) - stoc curent calculat din ledger
+	mux.Handle("/stock", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+
+		// calcul stoc: IN/RETURN adaugă la to_location, TRANSFER adaugă la to_location, CONSUM scade din from_location
+		// agregăm pe material + locație
+		sql := `
+	SELECT
+	m.id,
+	m.name,
+	m.unit,
+	l.id as location_id,
+	l.code,
+	l.name as location_name,
+	SUM(
+		CASE
+		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+		ELSE 0
+		END
+	) AS qty,
+	COALESCE(m.price, 0) AS unit_price,
+	COALESCE(m.price, 0) * SUM(
+		CASE
+		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+		ELSE 0
+		END
+	) AS total_value
+	FROM stock_movements sm
+	JOIN materials m ON m.id = sm.material_id
+	JOIN locations l ON l.active = TRUE AND (l.id = sm.to_location_id OR l.id = sm.from_location_id)
+	WHERE m.active = TRUE
+	`
+
+		args := []any{}
+		if q != "" {
+			sql += ` AND (m.name ILIKE '%' || $1 || '%' OR m.sku ILIKE '%' || $1 || '%')`
+			args = append(args, q)
+		}
+
+		sql += `
+	GROUP BY m.id, m.name, m.unit, m.price, l.id, l.code, l.name
+	HAVING SUM(
+		CASE
+		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+		ELSE 0
+		END
+	) <> 0
+	ORDER BY m.name, l.name
+	LIMIT 500
+	`
+
+		rows, err := db.Query(ctx, sql, args...)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		type Row struct {
+			MaterialID   int64   `json:"material_id"`
+			MaterialName string  `json:"material_name"`
+			Unit         string  `json:"unit"`
+			LocationID   int64   `json:"location_id"`
+			LocationCode string  `json:"location_code"`
+			LocationName string  `json:"location_name"`
+			Qty          float64 `json:"qty"`
+			UnitPrice    float64 `json:"unit_price"`
+			TotalValue   float64 `json:"total_value"`
+		}
+		var out []Row
+		for rows.Next() {
+			var (
+				rw    Row
+				qty   pgtype.Numeric
+				price pgtype.Numeric
+				total pgtype.Numeric
+			)
+			if err := rows.Scan(&rw.MaterialID, &rw.MaterialName, &rw.Unit, &rw.LocationID, &rw.LocationCode, &rw.LocationName, &qty, &price, &total); err != nil {
+				http.Error(w, "scan failed", http.StatusInternalServerError)
+				return
+			}
+			if qty.Valid {
+				f, err := qty.Float64Value()
+				if err == nil && f.Valid {
+					rw.Qty = f.Float64
+				}
+			}
+			// unit_price
+			if price.Valid {
+				f, err := price.Float64Value()
+				if err == nil && f.Valid {
+					rw.UnitPrice = f.Float64
+				}
+			}
+			// total_value
+			if total.Valid {
+				f, err := total.Float64Value()
+				if err == nil && f.Valid {
+					rw.TotalValue = f.Float64
+				}
+			}
+
+			out = append(out, rw)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	})))
+
+	// POST /stock/consume  (admin + employee) - consum pe lucrare
+	mux.Handle("/stock/consume", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		var req StockConsumeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		if req.ProjectID <= 0 || req.MaterialID <= 0 || req.Qty <= 0 {
+			http.Error(w, "project_id, material_id, qty required", http.StatusBadRequest)
+			return
+		}
+		req.Note = strings.TrimSpace(req.Note)
+
+		// default: consumăm din Zorilor dacă nu e specificat
+		fromLocationID := req.FromLocation
+		if fromLocationID <= 0 {
+			fromLocationID = defaultStockLocationID
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+
+		// 1) verificăm stoc disponibil
+		available, err := getStockQty(ctx, db, req.MaterialID, fromLocationID)
+		if err != nil {
+			http.Error(w, "stock check failed", http.StatusInternalServerError)
+			return
+		}
+		if available < req.Qty {
+			http.Error(w, "insufficient stock", http.StatusBadRequest)
+			return
+		}
+
+		// 2) unit price snapshot: dacă nu e dat, luăm materials.price
+		unitPrice := req.UnitPrice
+		if unitPrice <= 0 {
+			var p pgtype.Numeric
+			err := db.QueryRow(ctx, `SELECT price FROM materials WHERE id = $1 AND active = TRUE`, req.MaterialID).Scan(&p)
+			if err == nil && p.Valid {
+				f, err2 := p.Float64Value()
+				if err2 == nil && f.Valid {
+					unitPrice = f.Float64
+				}
+			}
+			// dacă tot nu avem, rămâne 0 (cost necunoscut) — acceptăm
+		}
+
+		// 3) inserăm mișcarea CONSUM
+		_, err = db.Exec(ctx, `
+	INSERT INTO stock_movements
+	(material_id, type, from_location_id, to_location_id, project_id, qty, unit_price_snapshot, created_by_user_id, note)
+	VALUES
+	($1, 'CONSUM', $2, NULL, $3, $4, NULLIF($5,0), $6, NULLIF($7,''))
+	`, req.MaterialID, fromLocationID, req.ProjectID, req.Qty, unitPrice, claims.UserID, req.Note)
+
+		if err != nil {
+			http.Error(w, "insert failed", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":                  true,
+			"from_location_id":    fromLocationID,
+			"available_before":    available,
+			"consumed":            req.Qty,
+			"unit_price_snapshot": unitPrice,
+		})
+	})))
+
+	// GET /projects/{id}/materials (admin + employee)
+	mux.Handle("/projects-materials/", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// folosim path separat ca să nu ne batem cu handlerul /projects/ existent
+		// format: /projects-materials/{id}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		path := strings.Trim(r.URL.Path, "/")
+		parts := strings.Split(path, "/")
+		if len(parts) != 2 || parts[0] != "projects-materials" {
+			http.NotFound(w, r)
+			return
+		}
+
+		projectID, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || projectID <= 0 {
+			http.Error(w, "invalid project id", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+
+		// listăm consumurile (CONSUM) pe proiect, agregat pe material + preț snapshot
+		rows, err := db.Query(ctx, `
+	SELECT
+	m.id,
+	m.name,
+	m.unit,
+	sm.unit_price_snapshot,
+	SUM(sm.qty) AS qty,
+	SUM(sm.qty * COALESCE(sm.unit_price_snapshot, 0)) AS cost
+	FROM stock_movements sm
+	JOIN materials m ON m.id = sm.material_id
+	WHERE sm.project_id = $1 AND sm.type = 'CONSUM'
+	GROUP BY m.id, m.name, m.unit, sm.unit_price_snapshot
+	ORDER BY m.name
+	`, projectID)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		type Item struct {
+			MaterialID int64   `json:"material_id"`
+			Name       string  `json:"name"`
+			Unit       string  `json:"unit"`
+			Qty        float64 `json:"qty"`
+			UnitPrice  float64 `json:"unit_price_snapshot"`
+			Cost       float64 `json:"cost"`
+		}
+
+		var (
+			items     []Item
+			totalCost float64
+		)
+
+		for rows.Next() {
+			var (
+				it    Item
+				price pgtype.Numeric
+				qty   pgtype.Numeric
+				cost  pgtype.Numeric
+			)
+
+			if err := rows.Scan(&it.MaterialID, &it.Name, &it.Unit, &price, &qty, &cost); err != nil {
+				http.Error(w, "scan failed", http.StatusInternalServerError)
+				return
+			}
+
+			if price.Valid {
+				f, err := price.Float64Value()
+				if err == nil && f.Valid {
+					it.UnitPrice = f.Float64
+				}
+			}
+			if qty.Valid {
+				f, err := qty.Float64Value()
+				if err == nil && f.Valid {
+					it.Qty = f.Float64
+				}
+			}
+			if cost.Valid {
+				f, err := cost.Float64Value()
+				if err == nil && f.Valid {
+					it.Cost = f.Float64
+					totalCost += it.Cost
+				}
+			}
+
+			items = append(items, it)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"project_id": projectID,
+			"items":      items,
+			"total_cost": totalCost,
+		})
+	})))
+
+	// POST /stock/transfer (admin + employee) - Zorilor -> Iris
+	mux.Handle("/stock/transfer", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		var req StockTransferRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		if req.MaterialID <= 0 || req.Qty <= 0 || req.ToLocationID <= 0 {
+			http.Error(w, "material_id, qty, to_location_id required", http.StatusBadRequest)
+			return
+		}
+		req.Note = strings.TrimSpace(req.Note)
+
+		fromLocationID := defaultStockLocationID // Zorilor
+
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+
+		// 1) verificăm stoc disponibil în Zorilor
+		available, err := getStockQty(ctx, db, req.MaterialID, fromLocationID)
+		if err != nil {
+			http.Error(w, "stock check failed", http.StatusInternalServerError)
+			return
+		}
+		if available < req.Qty {
+			http.Error(w, "insufficient stock", http.StatusBadRequest)
+			return
+		}
+
+		// 2) inserăm TRANSFER
+		_, err = db.Exec(ctx, `
+	INSERT INTO stock_movements
+	(material_id, type, from_location_id, to_location_id, project_id, qty, unit_price_snapshot, created_by_user_id, note)
+	VALUES
+	($1, 'TRANSFER', $2, $3, NULL, $4, NULL, $5, NULLIF($6,''))
+	`, req.MaterialID, fromLocationID, req.ToLocationID, req.Qty, claims.UserID, req.Note)
+
+		if err != nil {
+			http.Error(w, "insert failed", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":               true,
+			"from_location_id": fromLocationID,
+			"to_location_id":   req.ToLocationID,
+			"transferred":      req.Qty,
+		})
+	})))
+
+	// GET /export/stock.csv (admin only)
+	mux.Handle("/export/stock.csv", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+		if claims.Role != "admin" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		rows, err := db.Query(ctx, `
+	SELECT
+	m.id,
+	m.name,
+	m.unit,
+	l.code,
+	l.name,
+	SUM(
+		CASE
+		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+		ELSE 0
+		END
+	) AS qty
+	FROM stock_movements sm
+	JOIN materials m ON m.id = sm.material_id
+	JOIN locations l ON l.active = TRUE AND (l.id = sm.to_location_id OR l.id = sm.from_location_id)
+	WHERE m.active = TRUE
+	GROUP BY m.id, m.name, m.unit, l.code, l.name
+	HAVING SUM(
+		CASE
+		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+		ELSE 0
+		END
+	) <> 0
+	ORDER BY m.name, l.name
+	`)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="stock.csv"`)
+
+		// header
+		_, _ = w.Write([]byte("material_id,material_name,unit,location_code,location_name,qty\n"))
+
+		for rows.Next() {
+			var (
+				mid   int64
+				mname string
+				unit  string
+				lcode string
+				lname string
+				qty   pgtype.Numeric
+				qf    float64
+			)
+			if err := rows.Scan(&mid, &mname, &unit, &lcode, &lname, &qty); err != nil {
+				http.Error(w, "scan failed", http.StatusInternalServerError)
+				return
+			}
+			if qty.Valid {
+				f, err := qty.Float64Value()
+				if err == nil && f.Valid {
+					qf = f.Float64
+				}
+			}
+
+			line := fmt.Sprintf("%d,%q,%q,%q,%q,%.3f\n", mid, mname, unit, lcode, lname, qf)
+			_, _ = w.Write([]byte(line))
+		}
+	})))
+
+	// GET /export/project-materials.csv?project_id= (admin only)
+	mux.Handle("/export/project-materials.csv", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+		if claims.Role != "admin" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		pidStr := strings.TrimSpace(r.URL.Query().Get("project_id"))
+		projectID, err := strconv.ParseInt(pidStr, 10, 64)
+		if err != nil || projectID <= 0 {
+			http.Error(w, "project_id required", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		// project title
+		var title string
+		_ = db.QueryRow(ctx, `SELECT title FROM projects WHERE id = $1`, projectID).Scan(&title)
+
+		rows, err := db.Query(ctx, `
+	SELECT
+	m.id,
+	m.name,
+	m.unit,
+	sm.unit_price_snapshot,
+	SUM(sm.qty) AS qty,
+	SUM(sm.qty * COALESCE(sm.unit_price_snapshot, 0)) AS cost
+	FROM stock_movements sm
+	JOIN materials m ON m.id = sm.material_id
+	WHERE sm.project_id = $1 AND sm.type = 'CONSUM'
+	GROUP BY m.id, m.name, m.unit, sm.unit_price_snapshot
+	ORDER BY m.name
+	`, projectID)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		filename := fmt.Sprintf("project_%d_materials.csv", projectID)
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+
+		_, _ = w.Write([]byte("project_id,project_title,material_id,material_name,unit,qty,unit_price_snapshot,cost\n"))
+
+		var total float64
+
+		for rows.Next() {
+			var (
+				mid        int64
+				mname      string
+				unit       string
+				price      pgtype.Numeric
+				qty        pgtype.Numeric
+				cost       pgtype.Numeric
+				pf, qf, cf float64
+			)
+
+			if err := rows.Scan(&mid, &mname, &unit, &price, &qty, &cost); err != nil {
+				http.Error(w, "scan failed", http.StatusInternalServerError)
+				return
+			}
+
+			if price.Valid {
+				f, err := price.Float64Value()
+				if err == nil && f.Valid {
+					pf = f.Float64
+				}
+			}
+			if qty.Valid {
+				f, err := qty.Float64Value()
+				if err == nil && f.Valid {
+					qf = f.Float64
+				}
+			}
+			if cost.Valid {
+				f, err := cost.Float64Value()
+				if err == nil && f.Valid {
+					cf = f.Float64
+				}
+			}
+			total += cf
+
+			line := fmt.Sprintf("%d,%q,%d,%q,%q,%.3f,%.2f,%.2f\n", projectID, title, mid, mname, unit, qf, pf, cf)
+			_, _ = w.Write([]byte(line))
+		}
+
+		// total line
+		_, _ = w.Write([]byte(fmt.Sprintf("%d,%q,,,,,,%.2f\n", projectID, "TOTAL", total)))
+	})))
+
+	// GET /export/client-report.csv?client_id= (admin only)
+	mux.Handle("/export/client-report.csv", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+		if claims.Role != "admin" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		cidStr := strings.TrimSpace(r.URL.Query().Get("client_id"))
+		clientID, err := strconv.ParseInt(cidStr, 10, 64)
+		if err != nil || clientID <= 0 {
+			http.Error(w, "client_id required", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		var clientName string
+		err = db.QueryRow(ctx, `SELECT name FROM clients WHERE id = $1 AND archived = FALSE`, clientID).Scan(&clientName)
+		if err != nil {
+			http.Error(w, "client not found", http.StatusNotFound)
+			return
+		}
+
+		rows, err := db.Query(ctx, `
+	SELECT
+	p.id,
+	p.title,
+	p.status,
+	p.created_at,
+	COALESCE(SUM(sm.qty * COALESCE(sm.unit_price_snapshot, 0)), 0) AS cost
+	FROM projects p
+	LEFT JOIN stock_movements sm
+	ON sm.project_id = p.id AND sm.type = 'CONSUM'
+	WHERE p.client_id = $1 AND p.archived = FALSE
+	GROUP BY p.id, p.title, p.status, p.created_at
+	ORDER BY p.created_at DESC
+	`, clientID)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		filename := fmt.Sprintf("client_%d_report.csv", clientID)
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+
+		_, _ = w.Write([]byte("client_id,client_name,project_id,project_title,status,created_at,cost\n"))
+
+		var total float64
+
+		for rows.Next() {
+			var (
+				pid     int64
+				title   string
+				status  string
+				created time.Time
+				cost    pgtype.Numeric
+				cf      float64
+			)
+			if err := rows.Scan(&pid, &title, &status, &created, &cost); err != nil {
+				http.Error(w, "scan failed", http.StatusInternalServerError)
+				return
+			}
+			if cost.Valid {
+				f, err := cost.Float64Value()
+				if err == nil && f.Valid {
+					cf = f.Float64
+				}
+			}
+			total += cf
+
+			line := fmt.Sprintf("%d,%q,%d,%q,%q,%q,%.2f\n",
+				clientID, clientName, pid, title, status, created.Format(time.RFC3339), cf)
+			_, _ = w.Write([]byte(line))
+		}
+
+		// total line
+		_, _ = w.Write([]byte(fmt.Sprintf("%d,%q,,,,,%.2f\n", clientID, "TOTAL", total)))
+	})))
+
+	addr := ":8080"
+	log.Printf("API listening on %s", addr)
+	if err := http.ListenAndServe(addr, withCORS(mux)); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// pentru dev:
+		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func signJWT(secret string, claims UserClaims) (string, error) {
+	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return t.SignedString([]byte(secret))
+}
+
+func authMiddleware(secret string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenStr, err := extractBearer(r.Header.Get("Authorization"))
+		if err != nil {
+			http.Error(w, "missing/invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		claims := UserClaims{}
+		_, err = jwt.ParseWithClaims(tokenStr, &claims, func(token *jwt.Token) (any, error) {
+			if token.Method != jwt.SigningMethodHS256 {
+				return nil, errors.New("unexpected signing method")
+			}
+			return []byte(secret), nil
+		})
+		if err != nil {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), ctxUserKey, claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func requireRole(role string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+		if claims.Role != role {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func extractBearer(hdr string) (string, error) {
+	hdr = strings.TrimSpace(hdr)
+	if hdr == "" {
+		return "", errors.New("empty")
+	}
+	parts := strings.SplitN(hdr, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return "", errors.New("not bearer")
+	}
+	return strings.TrimSpace(parts[1]), nil
+}
+
+func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit string, price float64, minStock float64, category string) (int64, bool, error) {
+	name = strings.TrimSpace(name)
+	sku = strings.TrimSpace(sku)
+	unit = strings.TrimSpace(unit)
+	category = strings.TrimSpace(category)
+	if name == "" {
+		return 0, false, errors.New("name required")
+	}
+	if unit == "" {
+		unit = "buc"
+	}
+
+	// If SKU is provided, it is authoritative.
+	if sku != "" {
+		var id int64
+		err := db.QueryRow(ctx, `SELECT id FROM materials WHERE sku = $1 AND active = TRUE`, sku).Scan(&id)
+		if err == nil && id > 0 {
+			_, _ = db.Exec(ctx, `
+				UPDATE materials
+				SET name = $2,
+					unit = $3,
+					price = CASE WHEN $4 > 0 THEN ROUND($4::numeric,2) ELSE price END,
+					min_stock = CASE WHEN $5 > 0 THEN $5 ELSE min_stock END,
+					updated_at = NOW()
+				WHERE id = $1
+			`, id, name, unit, price, minStock)
+			if materialsHasCategory && category != "" {
+				_, _ = db.Exec(ctx, `UPDATE materials SET category = $2, updated_at = NOW() WHERE id = $1`, id, category)
+			}
+			return id, false, nil
+		}
+
+		var newID int64
+		err = db.QueryRow(ctx, `
+			INSERT INTO materials (name, sku, unit, price, min_stock)
+			VALUES ($1, NULLIF($2,''), $3, ROUND($4::numeric,2), NULLIF($5,0))
+			RETURNING id
+		`, name, sku, unit, price, minStock).Scan(&newID)
+		if err == nil {
+			if materialsHasCategory && category != "" {
+				_, _ = db.Exec(ctx, `UPDATE materials SET category = $2, updated_at = NOW() WHERE id = $1`, newID, category)
+			}
+			return newID, true, nil
+		}
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
+			// race: someone inserted same SKU
+			var id2 int64
+			if err2 := db.QueryRow(ctx, `SELECT id FROM materials WHERE sku = $1 AND active = TRUE`, sku).Scan(&id2); err2 == nil && id2 > 0 {
+				return id2, false, nil
+			}
+		}
+		return 0, false, err
+	}
+
+	// No SKU: match by logical key (lower(name), unit)
+	var id int64
+	err := db.QueryRow(ctx, `
+		SELECT id
+		FROM materials
+		WHERE active = TRUE
+		  AND LOWER(name) = LOWER($1)
+		  AND COALESCE(unit,'') = COALESCE($2,'')
+		ORDER BY id
+		LIMIT 1
+	`, name, unit).Scan(&id)
+	if err == nil && id > 0 {
+		_, _ = db.Exec(ctx, `
+			UPDATE materials
+			SET price = CASE WHEN $2 > 0 THEN $2 ELSE price END,
+				min_stock = CASE WHEN $3 > 0 THEN $3 ELSE min_stock END,
+				updated_at = NOW()
+			WHERE id = $1
+		`, id, price, minStock)
+		if materialsHasCategory && category != "" {
+			_, _ = db.Exec(ctx, `UPDATE materials SET category = $2, updated_at = NOW() WHERE id = $1`, id, category)
+		}
+		return id, false, nil
+	}
+
+	var newID int64
+	err = db.QueryRow(ctx, `
+		INSERT INTO materials (name, sku, unit, price, min_stock)
+		VALUES ($1, NULL, $2, NULLIF($3,0), $4)
+		RETURNING id
+	`, name, unit, price, minStock).Scan(&newID)
+	if err == nil {
+		if materialsHasCategory && category != "" {
+			_, _ = db.Exec(ctx, `UPDATE materials SET category = $2, updated_at = NOW() WHERE id = $1`, newID, category)
+		}
+		return newID, true, nil
+	}
+	if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
+		var id2 int64
+		if err2 := db.QueryRow(ctx, `
+			SELECT id
+			FROM materials
+			WHERE active = TRUE
+			  AND LOWER(name) = LOWER($1)
+			  AND COALESCE(unit,'') = COALESCE($2,'')
+			ORDER BY id
+			LIMIT 1
+		`, name, unit).Scan(&id2); err2 == nil && id2 > 0 {
+			return id2, false, nil
+		}
+	}
+	return 0, false, err
+}
+
+func getStockQty(ctx context.Context, db *pgxpool.Pool, materialID, locationID int64) (float64, error) {
+	// calculează stocul curent pentru un material într-o locație, din ledger
+	var qty pgtype.Numeric
+	err := db.QueryRow(ctx, `
+SELECT COALESCE(SUM(
+  CASE
+    WHEN type IN ('IN','RETURN') AND to_location_id = $2 THEN qty
+    WHEN type = 'TRANSFER' AND to_location_id = $2 THEN qty
+    WHEN type = 'TRANSFER' AND from_location_id = $2 THEN -qty
+    WHEN type = 'CONSUM' AND from_location_id = $2 THEN -qty
+    ELSE 0
+  END
+), 0)
+FROM stock_movements
+WHERE material_id = $1
+`, materialID, locationID).Scan(&qty)
+	if err != nil {
+		return 0, err
+	}
+
+	if qty.Valid {
+		f, err := qty.Float64Value()
+		if err == nil && f.Valid {
+			return f.Float64, nil
+		}
+	}
+	return 0, nil
+}

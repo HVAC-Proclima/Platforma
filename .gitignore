@@ -1,0 +1,24 @@
+# Node / Vite
+node_modules/
+dist/
+.build/
+.vercel/
+
+# Go
+*.exe
+*.out
+*.test
+bin/
+tmp/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
