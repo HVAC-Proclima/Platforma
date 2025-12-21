@@ -18,7 +18,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/crypto/bcrypt"	"path/filepath"
+	"sort"
+
 )
 
 type ctxKey string
@@ -372,16 +374,25 @@ func main() {
 	}
 	defer db.Close()
 
+	if err := db.Ping(ctx); err != nil {
+		log.Fatalf("unable to connect to database: %v", err)
+	}
+	log.Println("Connected to PostgreSQL")
+
+	// Optional: run SQL migrations on startup (Railway)
+	if os.Getenv("MIGRATE_ON_START") == "1" {
+		if err := runMigrations(ctx, db, "migrations"); err != nil {
+			log.Fatalf("migrations failed: %v", err)
+		}
+		log.Println("Migrations complete.")
+	}
+
 	// Detect optional columns used by the frontend (keeps API compatible across schemas).
 	ctxCols, cancelCols := context.WithTimeout(context.Background(), 2*time.Second)
 	detectMaterialsColumns(ctxCols, db)
 	detectUsersColumns(ctxCols, db)
 	cancelCols()
 
-	if err := db.Ping(ctx); err != nil {
-		log.Fatalf("unable to connect to database: %v", err)
-	}
-	log.Println("Connected to PostgreSQL")
 
 	// Ensure stock_movements_check allows CONSUM without project_id (used by Stock edit/delete).
 	{
@@ -3105,15 +3116,10 @@ WHERE id = $1
 		_, _ = w.Write([]byte(fmt.Sprintf("%d,%q,,,,,%.2f\n", clientID, "TOTAL", total)))
 	})))
 
-	port := os.Getenv("PORT")
-	if port == "" {
-	    port = "8080"
-	}
-	addr := "0.0.0.0:" + port
-	
+	addr := ":8080"
 	log.Printf("API listening on %s", addr)
 	if err := http.ListenAndServe(addr, withCORS(mux)); err != nil {
-	    log.Fatal(err)
+		log.Fatal(err)
 	}
 }
 
@@ -3327,4 +3333,77 @@ WHERE material_id = $1
 		}
 	}
 	return 0, nil
+}
+
+
+// --- Migrations (used when MIGRATE_ON_START=1) ---
+
+func runMigrations(ctx context.Context, db *pgxpool.Pool, migrationsDir string) error {
+	files, err := filepath.Glob(filepath.Join(migrationsDir, "*.sql"))
+	if err != nil {
+		return fmt.Errorf("glob migrations: %w", err)
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no .sql files found in %s", migrationsDir)
+	}
+
+	sort.Strings(files)
+
+	for _, path := range files {
+		version := filepath.Base(path)
+
+		applied, err := isApplied(ctx, db, version)
+		if err != nil {
+			return fmt.Errorf("check applied %s: %w", version, err)
+		}
+		if applied {
+			log.Printf("skip %s (already applied)", version)
+			continue
+		}
+
+		sqlBytes, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		sqlText := strings.TrimSpace(string(sqlBytes))
+		if sqlText == "" {
+			log.Printf("skip %s (empty)", version)
+			continue
+		}
+
+		log.Printf("apply %s", version)
+		if _, err := db.Exec(ctx, sqlText); err != nil {
+			return fmt.Errorf("apply %s failed: %w", version, err)
+		}
+
+		if err := ensureSchemaMigrations(ctx, db); err != nil {
+			return fmt.Errorf("ensure schema_migrations: %w", err)
+		}
+		if _, err := db.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, version); err != nil {
+			return fmt.Errorf("record migration %s: %w", version, err)
+		}
+
+		log.Printf("applied %s", version)
+	}
+
+	return nil
+}
+
+func ensureSchemaMigrations(ctx context.Context, db *pgxpool.Pool) error {
+	_, err := db.Exec(ctx, `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version TEXT PRIMARY KEY,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)`)
+	return err
+}
+
+func isApplied(ctx context.Context, db *pgxpool.Pool, version string) (bool, error) {
+	// ensure table exists (first deploy)
+	if err := ensureSchemaMigrations(ctx, db); err != nil {
+		return false, err
+	}
+	var exists bool
+	err := db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&exists)
+	return exists, err
 }
