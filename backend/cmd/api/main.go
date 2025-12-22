@@ -443,7 +443,7 @@ func main() {
 
 		// ✅ AICI adaugi testul real de DB (înainte de răspuns)
 		var one int
-		if err := db.QueryRow("SELECT 1").Scan(&one); err != nil {
+		if err := db.QueryRow(r.Context(), "SELECT 1").Scan(&one); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"status": "error",
