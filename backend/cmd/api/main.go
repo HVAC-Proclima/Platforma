@@ -14,8 +14,7 @@ import (
 	"time"
 	"syscall"
 	"os/signal"
-	"strings"
-
+	
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v5"
