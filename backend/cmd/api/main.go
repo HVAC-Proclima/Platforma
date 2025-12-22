@@ -425,6 +425,13 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// ROOT – pentru Railway / proxy / health implicit
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	// HEALTH – rămâne EXACT cum îl ai
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -3116,6 +3123,13 @@ WHERE id = $1
 		// total line
 		_, _ = w.Write([]byte(fmt.Sprintf("%d,%q,,,,,%.2f\n", clientID, "TOTAL", total)))
 	})))
+
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		s := <-sigCh
+		log.Printf("Received signal: %v (Railway is stopping the container)", s)
+	}()
 
 	port := os.Getenv("PORT")
 	if port == "" {
