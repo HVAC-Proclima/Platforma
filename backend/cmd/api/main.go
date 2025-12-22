@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 	"syscall"
+	"os/signal"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgconn"
@@ -3131,6 +3132,7 @@ WHERE id = $1
 		s := <-sigCh
 		log.Printf("Received signal: %v (Railway is stopping the container)", s)
 	}()
+
 
 	port := os.Getenv("PORT")
 	if port == "" {
