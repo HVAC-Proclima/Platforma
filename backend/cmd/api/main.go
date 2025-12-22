@@ -440,11 +440,25 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("HIT /health from %s %s %s", r.RemoteAddr, r.Method, r.UserAgent())
 		w.Header().Set("Content-Type", "application/json")
+
+		// ✅ AICI adaugi testul real de DB (înainte de răspuns)
+		var one int
+		if err := db.QueryRow("SELECT 1").Scan(&one); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"db":     err.Error(),
+			})
+			return
+		}
+
+		// răspunsul OK dacă DB e chiar conectată
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status": "ok",
 			"db":     "connected",
 		})
 	})
+
 
 	// LOGIN
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
