@@ -429,9 +429,11 @@ func main() {
 
 	// ROOT – pentru Railway / proxy / health implicit
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("HIT / from %s %s %s", r.RemoteAddr, r.Method, r.UserAgent())
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte("ok"))
 	})
 
 	// HEALTH – rămâne EXACT cum îl ai
