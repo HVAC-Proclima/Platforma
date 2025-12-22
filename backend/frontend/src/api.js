@@ -1,4 +1,4 @@
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8080"
+const API_URL = "https://platforma-production-4ff1.up.railway.app";
 
 function getToken() {
   return localStorage.getItem("token")
