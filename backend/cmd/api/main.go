@@ -429,12 +429,14 @@ func main() {
 
 	// ROOT – pentru Railway / proxy / health implicit
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("HIT / from %s %s %s", r.RemoteAddr, r.Method, r.UserAgent())
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 
 	// HEALTH – rămâne EXACT cum îl ai
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("HIT /health from %s %s %s", r.RemoteAddr, r.Method, r.UserAgent())
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status": "ok",
@@ -3381,7 +3383,6 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool, migrationsDir string) 
 			return fmt.Errorf("check applied %s: %w", version, err)
 		}
 		if applied {
-			log.Printf("skip %s (already applied)", version)
 			continue
 		}
 
