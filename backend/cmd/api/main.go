@@ -340,7 +340,7 @@ type StockImportRow struct {
 	Unit     string  `json:"unit,omitempty"`
 	Price    float64 `json:"price,omitempty"`
 	Qty      float64 `json:"qty"`
-	Category string  `json:"category,omitempty"`
+	Category *string  `json:"category,omitempty"`
 }
 
 type StockImportRequest struct {
