@@ -1041,7 +1041,7 @@ WHERE id = $1
 				args = append(args, q)
 			}
 
-			query += ` ORDER BY name LIMIT 20`
+			query += ` ORDER BY name`
 
 			rows, err := db.Query(ctx, query, args...)
 			if err != nil {
@@ -1554,7 +1554,7 @@ WHERE id = $1
 				args = append(args, q)
 			}
 
-			query += ` ORDER BY name LIMIT 20`
+			query += ` ORDER BY name`
 
 			rows, err := db.Query(ctx, query, args...)
 			if err != nil {
@@ -2045,7 +2045,7 @@ WHERE id = $1
 				args = append(args, q)
 			}
 
-			query += ` ORDER BY name LIMIT 20`
+			query += ` ORDER BY name`
 
 			rows, err := db.Query(ctx, query, args...)
 			if err != nil {
@@ -2576,7 +2576,7 @@ WHERE id = $1
 		END
 	) <> 0
 	ORDER BY m.name, l.name
-	LIMIT 500
+	LIMIT 2000
 	`
 
 		rows, err := db.Query(ctx, sql, args...)
