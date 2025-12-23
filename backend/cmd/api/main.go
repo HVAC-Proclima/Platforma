@@ -202,17 +202,19 @@ type MaterialListItem struct {
 }
 
 func detectMaterialsColumns(ctx context.Context, db *pgxpool.Pool) {
-  var hasCat bool
-  _ = db.QueryRow(ctx, `
-    SELECT EXISTS (
-      SELECT 1
-      FROM information_schema.columns
-      WHERE table_name = 'materials'
-        AND column_name = 'category'
-    )
-  `).Scan(&hasCat)
-  materialsHasCategory = hasCat
-  log.Printf("materialsHasCategory=%v", materialsHasCategory)
+	// Optional columns (schema may differ between environments).
+	// Used for non-critical fields required by the frontend.
+	var hasCat bool
+	_ = db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'materials'
+			  AND column_name = 'category'
+		)
+	`).Scan(&hasCat)
+	materialsHasCategory = hasCat
 }
 
 func detectUsersColumns(ctx context.Context, db *pgxpool.Pool) {
@@ -340,7 +342,7 @@ type StockImportRow struct {
 	Unit     string  `json:"unit,omitempty"`
 	Price    float64 `json:"price,omitempty"`
 	Qty      float64 `json:"qty"`
-	Category *string  `json:"category,omitempty"`
+	Category string  `json:"category,omitempty"`
 }
 
 type StockImportRequest struct {
@@ -1039,7 +1041,7 @@ WHERE id = $1
 				args = append(args, q)
 			}
 
-			query += ` ORDER BY name`
+			query += ` ORDER BY name LIMIT 20`
 
 			rows, err := db.Query(ctx, query, args...)
 			if err != nil {
@@ -1552,7 +1554,7 @@ WHERE id = $1
 				args = append(args, q)
 			}
 
-			query += ` ORDER BY name`
+			query += ` ORDER BY name LIMIT 20`
 
 			rows, err := db.Query(ctx, query, args...)
 			if err != nil {
@@ -2043,7 +2045,7 @@ WHERE id = $1
 				args = append(args, q)
 			}
 
-			query += ` ORDER BY name`
+			query += ` ORDER BY name LIMIT 20`
 
 			rows, err := db.Query(ctx, query, args...)
 			if err != nil {
@@ -2295,13 +2297,8 @@ WHERE id = $1
 			if row.Unit == "" {
 				row.Unit = "buc"
 			}
-			
-			cat := ""
-			if row.Category != nil {
-			  cat = strings.TrimSpace(*row.Category)
-			}
 
-			mid, created, err := upsertMaterial(ctx, db, row.Name, row.SKU, row.Unit, row.Price, 0, cat)
+			mid, created, err := upsertMaterial(ctx, db, row.Name, row.SKU, row.Unit, row.Price, 0, row.Category)
 			if err != nil {
 				http.Error(w, fmt.Sprintf("row %d: material upsert failed", i+1), http.StatusBadRequest)
 				return
@@ -2537,64 +2534,64 @@ WHERE id = $1
 		sql := ""
 		if materialsHasCategory {
 			sql = `
-		SELECT
-		  m.id,
-		  m.name,
-		  m.unit,
-		  COALESCE(m.category,'') AS category,
-		  l.id as location_id,
-		  l.code,
-		  l.name as location_name,
-		  SUM(
-			CASE
-			  WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
-			  WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
-			  ELSE 0
-			END
-		  ) AS qty,
-		  COALESCE(m.price, 0) AS unit_price,
-		  COALESCE(m.price, 0) * SUM(
-			CASE
-			  WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
-			  WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
-			  ELSE 0
-			END
-		  ) AS total_value
-		FROM stock_movements sm
-		JOIN materials m ON m.id = sm.material_id
-		JOIN locations l ON l.active = TRUE AND (l.id = sm.to_location_id OR l.id = sm.from_location_id)
-		WHERE m.active = TRUE
-		`
+	SELECT
+	m.id,
+	m.name,
+	m.unit,
+	COALESCE(m.category,'') AS category,
+	l.id as location_id,
+	l.code,
+	l.name as location_name,
+	SUM(
+		CASE
+		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+		ELSE 0
+		END
+	) AS qty,
+	COALESCE(m.price, 0) AS unit_price,
+	COALESCE(m.price, 0) * SUM(
+		CASE
+		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+		ELSE 0
+		END
+	) AS total_value
+	FROM stock_movements sm
+	JOIN materials m ON m.id = sm.material_id
+	JOIN locations l ON l.active = TRUE AND (l.id = sm.to_location_id OR l.id = sm.from_location_id)
+	WHERE m.active = TRUE
+	`
 		} else {
 			sql = `
-		SELECT
-		  m.id,
-		  m.name,
-		  m.unit,
-		  '' AS category,
-		  l.id as location_id,
-		  l.code,
-		  l.name as location_name,
-		  SUM(
-			CASE
-			  WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
-			  WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
-			  ELSE 0
-			END
-		  ) AS qty,
-		  COALESCE(m.price, 0) AS unit_price,
-		  COALESCE(m.price, 0) * SUM(
-			CASE
-			  WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
-			  WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
-			  ELSE 0
-			END
-		  ) AS total_value
-		FROM stock_movements sm
-		JOIN materials m ON m.id = sm.material_id
-		JOIN locations l ON l.active = TRUE AND (l.id = sm.to_location_id OR l.id = sm.from_location_id)
-		WHERE m.active = TRUE
-		`
+	SELECT
+	m.id,
+	m.name,
+	m.unit,
+	'' AS category,
+	l.id as location_id,
+	l.code,
+	l.name as location_name,
+	SUM(
+		CASE
+		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+		ELSE 0
+		END
+	) AS qty,
+	COALESCE(m.price, 0) AS unit_price,
+	COALESCE(m.price, 0) * SUM(
+		CASE
+		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+		ELSE 0
+		END
+	) AS total_value
+	FROM stock_movements sm
+	JOIN materials m ON m.id = sm.material_id
+	JOIN locations l ON l.active = TRUE AND (l.id = sm.to_location_id OR l.id = sm.from_location_id)
+	WHERE m.active = TRUE
+	`
 		}
 
 		args := []any{}
@@ -2605,27 +2602,15 @@ WHERE id = $1
 
 		if materialsHasCategory {
 			sql += `
-		GROUP BY m.id, m.name, m.unit, m.category, m.price, l.id, l.code, l.name
-		`
+	GROUP BY m.id, m.name, m.unit, m.category, m.price, l.id, l.code, l.name
+	`
 		} else {
 			sql += `
-		GROUP BY m.id, m.name, m.unit, m.price, l.id, l.code, l.name
-		`
+	GROUP BY m.id, m.name, m.unit, m.price, l.id, l.code, l.name
+	`
 		}
 
-sql += `
-HAVING SUM(
-  CASE
-    WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
-    WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
-    ELSE 0
-  END
-) <> 0
-ORDER BY m.name, l.name
-LIMIT 2000
-`
-
-
+		sql += `
 	HAVING SUM(
 		CASE
 		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
@@ -2636,6 +2621,7 @@ LIMIT 2000
 	ORDER BY m.name, l.name
 	LIMIT 2000
 	`
+
 
 		rows, err := db.Query(ctx, sql, args...)
 		if err != nil {
@@ -2648,7 +2634,7 @@ LIMIT 2000
 			MaterialID   int64   `json:"material_id"`
 			MaterialName string  `json:"material_name"`
 			Unit         string  `json:"unit"`
-			Category     string  `json:"category,omitempty"`
+			Category     string  `json:"category"`
 			LocationID   int64   `json:"location_id"`
 			LocationCode string  `json:"location_code"`
 			LocationName string  `json:"location_name"`
@@ -2665,23 +2651,12 @@ LIMIT 2000
 				total pgtype.Numeric
 			)
 			var cat pgtype.Text
-			if err := rows.Scan(
-			  &rw.MaterialID,
-			  &rw.MaterialName,
-			  &rw.Unit,
-			  &cat, // 👈 nou
-			  &rw.LocationID,
-			  &rw.LocationCode,
-			  &rw.LocationName,
-			  &qty,
-			  &price,
-			  &total,
-			); err != nil {
+			if err := rows.Scan(&rw.MaterialID, &rw.MaterialName, &rw.Unit, &cat, &rw.LocationID, &rw.LocationCode, &rw.LocationName, &qty, &price, &total); err != nil {
 				http.Error(w, "scan failed", http.StatusInternalServerError)
 				return
 			}
 			if cat.Valid {
-			  rw.Category = cat.String
+				rw.Category = cat.String
 			}
 			if qty.Valid {
 				f, err := qty.Float64Value()
@@ -3387,7 +3362,7 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 	if err == nil && id > 0 {
 		_, _ = db.Exec(ctx, `
 			UPDATE materials
-			SET price = CASE WHEN $2 > 0 THEN ROUND($2::numeric,2) ELSE price END,
+			SET price = CASE WHEN $2 > 0 THEN $2 ELSE price END,
 				min_stock = CASE WHEN $3 > 0 THEN $3 ELSE min_stock END,
 				updated_at = NOW()
 			WHERE id = $1
@@ -3401,7 +3376,7 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 	var newID int64
 	err = db.QueryRow(ctx, `
 		INSERT INTO materials (name, sku, unit, price, min_stock)
-		VALUES ($1, NULL, $2, NULLIF(ROUND($3::numeric,2),0), $4)
+		VALUES ($1, NULL, $2, NULLIF($3,0), $4)
 		RETURNING id
 	`, name, unit, price, minStock).Scan(&newID)
 	if err == nil {
@@ -3429,7 +3404,7 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 
 // stockQtyQuerier is implemented by both *pgxpool.Pool and pgx.Tx.
 type stockQtyQuerier interface {
-    QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 func getStockQty(ctx context.Context, q stockQtyQuerier, materialID, locationID int64) (float64, error) {
