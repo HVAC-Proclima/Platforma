@@ -2295,8 +2295,13 @@ WHERE id = $1
 			if row.Unit == "" {
 				row.Unit = "buc"
 			}
+			
+			cat := ""
+			if row.Category != nil {
+			  cat = strings.TrimSpace(*row.Category)
+			}
 
-			mid, created, err := upsertMaterial(ctx, db, row.Name, row.SKU, row.Unit, row.Price, 0, row.Category)
+			mid, created, err := upsertMaterial(ctx, db, row.Name, row.SKU, row.Unit, row.Price, 0, cat)
 			if err != nil {
 				http.Error(w, fmt.Sprintf("row %d: material upsert failed", i+1), http.StatusBadRequest)
 				return
