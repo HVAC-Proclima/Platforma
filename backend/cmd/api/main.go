@@ -2534,40 +2534,68 @@ WHERE id = $1
 
 		// calcul stoc: IN/RETURN adaugă la to_location, TRANSFER adaugă la to_location, CONSUM scade din from_location
 		// agregăm pe material + locație
-		sql := `
-	SELECT
-	  m.id,
-	  m.name,
-	  m.unit,
-	  ` + func() string {
+		sql := ""
 		if materialsHasCategory {
-		  return `COALESCE(m.category,'') AS category,`
+			sql = `
+		SELECT
+		  m.id,
+		  m.name,
+		  m.unit,
+		  COALESCE(m.category,'') AS category,
+		  l.id as location_id,
+		  l.code,
+		  l.name as location_name,
+		  SUM(
+			CASE
+			  WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+			  WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+			  ELSE 0
+			END
+		  ) AS qty,
+		  COALESCE(m.price, 0) AS unit_price,
+		  COALESCE(m.price, 0) * SUM(
+			CASE
+			  WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+			  WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+			  ELSE 0
+			END
+		  ) AS total_value
+		FROM stock_movements sm
+		JOIN materials m ON m.id = sm.material_id
+		JOIN locations l ON l.active = TRUE AND (l.id = sm.to_location_id OR l.id = sm.from_location_id)
+		WHERE m.active = TRUE
+		`
+		} else {
+			sql = `
+		SELECT
+		  m.id,
+		  m.name,
+		  m.unit,
+		  '' AS category,
+		  l.id as location_id,
+		  l.code,
+		  l.name as location_name,
+		  SUM(
+			CASE
+			  WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+			  WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+			  ELSE 0
+			END
+		  ) AS qty,
+		  COALESCE(m.price, 0) AS unit_price,
+		  COALESCE(m.price, 0) * SUM(
+			CASE
+			  WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+			  WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+			  ELSE 0
+			END
+		  ) AS total_value
+		FROM stock_movements sm
+		JOIN materials m ON m.id = sm.material_id
+		JOIN locations l ON l.active = TRUE AND (l.id = sm.to_location_id OR l.id = sm.from_location_id)
+		WHERE m.active = TRUE
+		`
 		}
-		return `'' AS category,`
-	  }() + `
-	  l.id as location_id,
-	  l.code,
-	  l.name as location_name,
-	SUM(
-		CASE
-		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
-		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
-		ELSE 0
-		END
-	) AS qty,
-	COALESCE(m.price, 0) AS unit_price,
-	COALESCE(m.price, 0) * SUM(
-		CASE
-		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
-		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
-		ELSE 0
-		END
-	) AS total_value
-	FROM stock_movements sm
-	JOIN materials m ON m.id = sm.material_id
-	JOIN locations l ON l.active = TRUE AND (l.id = sm.to_location_id OR l.id = sm.from_location_id)
-	WHERE m.active = TRUE
-	`
 
 		args := []any{}
 		if q != "" {
@@ -2575,11 +2603,28 @@ WHERE id = $1
 			args = append(args, q)
 		}
 
-		sql += `
-	groupBy := `GROUP BY m.id, m.name, m.unit, m.price, l.id, l.code, l.name`
-	if materialsHasCategory {
-	  groupBy = `GROUP BY m.id, m.name, m.unit, m.category, m.price, l.id, l.code, l.name`
-	}
+		if materialsHasCategory {
+			sql += `
+		GROUP BY m.id, m.name, m.unit, m.category, m.price, l.id, l.code, l.name
+		`
+		} else {
+			sql += `
+		GROUP BY m.id, m.name, m.unit, m.price, l.id, l.code, l.name
+		`
+		}
+
+sql += `
+HAVING SUM(
+  CASE
+    WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
+    WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
+    ELSE 0
+  END
+) <> 0
+ORDER BY m.name, l.name
+LIMIT 2000
+`
+
 
 	HAVING SUM(
 		CASE
