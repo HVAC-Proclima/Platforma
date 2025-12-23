@@ -202,19 +202,17 @@ type MaterialListItem struct {
 }
 
 func detectMaterialsColumns(ctx context.Context, db *pgxpool.Pool) {
-	// Optional columns (schema may differ between environments).
-	// Used for non-critical fields required by the frontend.
-	var hasCat bool
-	_ = db.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1
-			FROM information_schema.columns
-			WHERE table_schema = 'public'
-			  AND table_name = 'materials'
-			  AND column_name = 'category'
-		)
-	`).Scan(&hasCat)
-	materialsHasCategory = hasCat
+  var hasCat bool
+  _ = db.QueryRow(ctx, `
+    SELECT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_name = 'materials'
+        AND column_name = 'category'
+    )
+  `).Scan(&hasCat)
+  materialsHasCategory = hasCat
+  log.Printf("materialsHasCategory=%v", materialsHasCategory)
 }
 
 func detectUsersColumns(ctx context.Context, db *pgxpool.Pool) {
