@@ -3362,7 +3362,7 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 	if err == nil && id > 0 {
 		_, _ = db.Exec(ctx, `
 			UPDATE materials
-			SET price = CASE WHEN $2 > 0 THEN $2 ELSE price END,
+			SET price = CASE WHEN $2 > 0 THEN ROUND($2::numeric,2) ELSE price END,
 				min_stock = CASE WHEN $3 > 0 THEN $3 ELSE min_stock END,
 				updated_at = NOW()
 			WHERE id = $1
@@ -3376,7 +3376,7 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 	var newID int64
 	err = db.QueryRow(ctx, `
 		INSERT INTO materials (name, sku, unit, price, min_stock)
-		VALUES ($1, NULL, $2, NULLIF($3,0), $4)
+		VALUES ($1, NULL, $2, NULLIF(ROUND($3::numeric,2),0), $4)
 		RETURNING id
 	`, name, unit, price, minStock).Scan(&newID)
 	if err == nil {
