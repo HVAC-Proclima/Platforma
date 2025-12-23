@@ -2536,12 +2536,18 @@ WHERE id = $1
 		// agregăm pe material + locație
 		sql := `
 	SELECT
-	m.id,
-	m.name,
-	m.unit,
-	l.id as location_id,
-	l.code,
-	l.name as location_name,
+	  m.id,
+	  m.name,
+	  m.unit,
+	  ` + func() string {
+		if materialsHasCategory {
+		  return `COALESCE(m.category,'') AS category,`
+		}
+		return `'' AS category,`
+	  }() + `
+	  l.id as location_id,
+	  l.code,
+	  l.name as location_name,
 	SUM(
 		CASE
 		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
@@ -2570,7 +2576,11 @@ WHERE id = $1
 		}
 
 		sql += `
-	GROUP BY m.id, m.name, m.unit, m.price, l.id, l.code, l.name
+	groupBy := `GROUP BY m.id, m.name, m.unit, m.price, l.id, l.code, l.name`
+	if materialsHasCategory {
+	  groupBy = `GROUP BY m.id, m.name, m.unit, m.category, m.price, l.id, l.code, l.name`
+	}
+
 	HAVING SUM(
 		CASE
 		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
@@ -2593,6 +2603,7 @@ WHERE id = $1
 			MaterialID   int64   `json:"material_id"`
 			MaterialName string  `json:"material_name"`
 			Unit         string  `json:"unit"`
+			Category     string  `json:"category,omitempty"`
 			LocationID   int64   `json:"location_id"`
 			LocationCode string  `json:"location_code"`
 			LocationName string  `json:"location_name"`
@@ -2608,9 +2619,24 @@ WHERE id = $1
 				price pgtype.Numeric
 				total pgtype.Numeric
 			)
-			if err := rows.Scan(&rw.MaterialID, &rw.MaterialName, &rw.Unit, &rw.LocationID, &rw.LocationCode, &rw.LocationName, &qty, &price, &total); err != nil {
+			var cat pgtype.Text
+			if err := rows.Scan(
+			  &rw.MaterialID,
+			  &rw.MaterialName,
+			  &rw.Unit,
+			  &cat, // 👈 nou
+			  &rw.LocationID,
+			  &rw.LocationCode,
+			  &rw.LocationName,
+			  &qty,
+			  &price,
+			  &total,
+			); err != nil {
 				http.Error(w, "scan failed", http.StatusInternalServerError)
 				return
+			}
+			if cat.Valid {
+			  rw.Category = cat.String
 			}
 			if qty.Valid {
 				f, err := qty.Float64Value()
