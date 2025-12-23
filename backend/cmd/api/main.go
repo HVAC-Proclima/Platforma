@@ -3429,7 +3429,7 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 
 // stockQtyQuerier is implemented by both *pgxpool.Pool and pgx.Tx.
 type stockQtyQuerier interface {
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+    QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 func getStockQty(ctx context.Context, q stockQtyQuerier, materialID, locationID int64) (float64, error) {
