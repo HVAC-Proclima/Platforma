@@ -7,7 +7,10 @@ import autoTable from "jspdf-autotable"
 
 function money(x) {
   const n = Number(x || 0)
-  return `${n.toFixed(2)} RON`
+  return new Intl.NumberFormat("ro-RO", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(n) + " RON"
 }
 
 function labelStatus(s) {
