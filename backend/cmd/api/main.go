@@ -177,8 +177,8 @@ type CreateMaterialRequest struct {
 	Name     string  `json:"name"`
 	SKU      string  `json:"sku,omitempty"`
 	Unit     string  `json:"unit,omitempty"`
-	Price    float64 `json:"price,omitempty"`
-	MinStock float64 `json:"min_stock,omitempty"`
+	Price    pgtype.Numeric `json:"price,omitempty"`
+	MinStock pgtype.Numeric `json:"min_stock,omitempty"`
 	Category string  `json:"category,omitempty"`
 }
 
@@ -3294,7 +3294,7 @@ func extractBearer(hdr string) (string, error) {
 	return strings.TrimSpace(parts[1]), nil
 }
 
-func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit string, price float64, minStock float64, category string) (int64, bool, error) {
+func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit string, price pgtype.Numeric, minStock pgtype.Numeric, category string) (int64, bool, error) {
 	name = strings.TrimSpace(name)
 	sku = strings.TrimSpace(sku)
 	unit = strings.TrimSpace(unit)
@@ -3329,7 +3329,7 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 		var newID int64
 		err = db.QueryRow(ctx, `
 			INSERT INTO materials (name, sku, unit, price, min_stock)
-			VALUES ($1, NULLIF($2,''), $3, ROUND($4::numeric,2), NULLIF($5,0))
+			VALUES ($1, NULLIF($2,''), $3, ROUND($4,2), NULLIF($5,0))
 			RETURNING id
 		`, name, sku, unit, price, minStock).Scan(&newID)
 		if err == nil {
