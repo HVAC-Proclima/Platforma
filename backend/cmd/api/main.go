@@ -177,8 +177,8 @@ type CreateMaterialRequest struct {
 	Name     string  `json:"name"`
 	SKU      string  `json:"sku,omitempty"`
 	Unit     string  `json:"unit,omitempty"`
-	Price    pgtype.Numeric `json:"price,omitempty"`
-	MinStock pgtype.Numeric `json:"min_stock,omitempty"`
+	Price    float64 `json:"price,omitempty"`
+	MinStock float64 `json:"min_stock,omitempty"`
 	Category string  `json:"category,omitempty"`
 }
 
@@ -3294,7 +3294,7 @@ func extractBearer(hdr string) (string, error) {
 	return strings.TrimSpace(parts[1]), nil
 }
 
-func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit string, price pgtype.Numeric, minStock pgtype.Numeric, category string) (int64, bool, error) {
+func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit string, price float64, minStock float64, category string) (int64, bool, error) {
 	name = strings.TrimSpace(name)
 	sku = strings.TrimSpace(sku)
 	unit = strings.TrimSpace(unit)
@@ -3306,6 +3306,11 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 		unit = "buc"
 	}
 
+	// NOTE: don't rely on float64 -> numeric implicit conversion for price/min_stock.
+	// Use fixed-scale strings so PostgreSQL always receives the exact decimals.
+	priceStr := fmt.Sprintf("%.2f", price)
+	minStockStr := fmt.Sprintf("%.3f", minStock)
+
 	// If SKU is provided, it is authoritative.
 	if sku != "" {
 		var id int64
@@ -3315,11 +3320,11 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 				UPDATE materials
 				SET name = $2,
 					unit = $3,
-					price = CASE WHEN $4 > 0 THEN ROUND($4::numeric,2) ELSE price END,
-					min_stock = CASE WHEN $5 > 0 THEN $5 ELSE min_stock END,
+					price = CASE WHEN $4::numeric > 0 THEN ROUND($4::numeric,2) ELSE price END,
+					min_stock = CASE WHEN $5::numeric > 0 THEN $5::numeric ELSE min_stock END,
 					updated_at = NOW()
 				WHERE id = $1
-			`, id, name, unit, price, minStock)
+			`, id, name, unit, priceStr, minStockStr)
 			if materialsHasCategory && category != "" {
 				_, _ = db.Exec(ctx, `UPDATE materials SET category = $2, updated_at = NOW() WHERE id = $1`, id, category)
 			}
@@ -3329,9 +3334,9 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 		var newID int64
 		err = db.QueryRow(ctx, `
 			INSERT INTO materials (name, sku, unit, price, min_stock)
-			VALUES ($1, NULLIF($2,''), $3, ROUND($4,2), NULLIF($5,0))
+			VALUES ($1, NULLIF($2,''), $3, ROUND($4::numeric,2), NULLIF($5::numeric,0))
 			RETURNING id
-		`, name, sku, unit, price, minStock).Scan(&newID)
+		`, name, sku, unit, priceStr, minStockStr).Scan(&newID)
 		if err == nil {
 			if materialsHasCategory && category != "" {
 				_, _ = db.Exec(ctx, `UPDATE materials SET category = $2, updated_at = NOW() WHERE id = $1`, newID, category)
@@ -3362,11 +3367,11 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 	if err == nil && id > 0 {
 		_, _ = db.Exec(ctx, `
 			UPDATE materials
-			SET price = CASE WHEN $2 > 0 THEN ROUND($2::numeric,2) ELSE price END,
-				min_stock = CASE WHEN $3 > 0 THEN $3 ELSE min_stock END,
+			SET price = CASE WHEN $2::numeric > 0 THEN ROUND($2::numeric,2) ELSE price END,
+				min_stock = CASE WHEN $3::numeric > 0 THEN $3::numeric ELSE min_stock END,
 				updated_at = NOW()
 			WHERE id = $1
-		`, id, price, minStock)
+		`, id, priceStr, minStockStr)
 		if materialsHasCategory && category != "" {
 			_, _ = db.Exec(ctx, `UPDATE materials SET category = $2, updated_at = NOW() WHERE id = $1`, id, category)
 		}
@@ -3376,9 +3381,9 @@ func upsertMaterial(ctx context.Context, db *pgxpool.Pool, name, sku, unit strin
 	var newID int64
 	err = db.QueryRow(ctx, `
 		INSERT INTO materials (name, sku, unit, price, min_stock)
-		VALUES ($1, NULL, $2, NULLIF(ROUND($3::numeric,2),0), $4)
+		VALUES ($1, NULL, $2, NULLIF(ROUND($3::numeric,2),0), $4::numeric)
 		RETURNING id
-	`, name, unit, price, minStock).Scan(&newID)
+	`, name, unit, priceStr, minStockStr).Scan(&newID)
 	if err == nil {
 		if materialsHasCategory && category != "" {
 			_, _ = db.Exec(ctx, `UPDATE materials SET category = $2, updated_at = NOW() WHERE id = $1`, newID, category)
