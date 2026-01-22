@@ -280,6 +280,14 @@ export default function ProjectDetails() {
     noticeTimerRef.current = setTimeout(() => setNotice(null), 3500)
   }
 
+	async function refreshMaterialsAndStock() {
+	  const mats = await apiFetch(`/projects-materials/${projectID}`)
+	  setMaterials(mats)
+
+	  const stockRes = await apiFetch(`/stock`)
+	  const sr = Array.isArray(stockRes) ? stockRes : (stockRes?.value ?? stockRes?.items ?? [])
+	  setStockRows(sr)
+	}
 
   async function loadAll() {
     setLoading(true)
@@ -878,15 +886,27 @@ export default function ProjectDetails() {
                         <button
                           className="rounded-lg bg-red-500/20 px-2 py-1 hover:bg-red-500/30"
                           type="button"
-                          onClick={() => {
-                            if (!window.confirm("Ștergi consumul pentru acest material? (Doar local, până adăugăm API-ul)")) return
-                            setMaterials((prev) => {
-                              const items = (prev?.items || []).filter((x) => Number(x.material_id) !== Number(it.material_id))
-                              const total_cost = items.reduce((s, x) => s + Number(x.cost || 0), 0)
-                              return prev ? { ...prev, items, total_cost } : prev
-                            })
-                            flash("ok", "Consum șters.")
-                          }}
+                          onClick={async () => {
+							  if (!window.confirm("Ștergi consumul pentru acest material? (va returna automat în stoc)")) return
+
+							  try {
+								await apiFetch("/projects-materials/set", {
+								  method: "POST",
+								  body: JSON.stringify({
+									project_id: projectID,
+									material_id: Number(it.material_id),
+									qty: 0, // delete = 0 => retur complet în backend
+									// unit_price nu e necesar la delete
+									note: "delete from UI",
+								  }),
+								})
+
+								await refreshMaterialsAndStock()
+								flash("ok", "Consum șters (returnat în stoc).")
+							  } catch (e) {
+								flash("err", e?.message || "Ștergerea a eșuat.")
+							  }
+							}}
                         >
                           Șterge
                         </button>
