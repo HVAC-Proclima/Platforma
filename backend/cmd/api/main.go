@@ -201,6 +201,14 @@ type MaterialListItem struct {
 	Active   bool    `json:"active"`
 }
 
+type ProjectMaterialSetRequest struct {
+	ProjectID        int64   `json:"project_id"`
+	MaterialID       int64   `json:"material_id"`
+	Qty              float64 `json:"qty"` // poate fi 0 (delete)
+	UnitPriceSnapshot float64 `json:"unit_price_snapshot,omitempty"`
+	Note             string  `json:"note,omitempty"`
+}
+
 func detectMaterialsColumns(ctx context.Context, db *pgxpool.Pool) {
 	// Optional columns (schema may differ between environments).
 	// Used for non-critical fields required by the frontend.
@@ -2858,6 +2866,159 @@ WHERE id = $1
 			"project_id": projectID,
 			"items":      items,
 			"total_cost": totalCost,
+		})
+	})))
+	
+	// POST /projects-materials/set (admin + employee)
+	// Setează cantitatea FINALĂ consumată pentru (project_id, material_id).
+	// Implementare ledger-based:
+	// 1) RETURN la tot consumul curent (din locația de unde a venit)
+	// 2) CONSUM din nou pentru qty finală
+	mux.Handle("/projects-materials/set", authMiddleware(jwtSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		claims := r.Context().Value(ctxUserKey).(UserClaims)
+
+		var req ProjectMaterialSetRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		if req.ProjectID <= 0 || req.MaterialID <= 0 {
+			http.Error(w, "project_id and material_id required", http.StatusBadRequest)
+			return
+		}
+		if req.Qty < 0 {
+			http.Error(w, "qty must be >= 0", http.StatusBadRequest)
+			return
+		}
+		req.Note = strings.TrimSpace(req.Note)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+		defer cancel()
+
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			http.Error(w, "tx begin failed", http.StatusInternalServerError)
+			return
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+
+		// validăm proiect + material
+		var ok bool
+		if err := tx.QueryRow(ctx, `SELECT TRUE FROM projects WHERE id=$1 AND archived=FALSE`, req.ProjectID).Scan(&ok); err != nil {
+			http.Error(w, "invalid project_id", http.StatusBadRequest)
+			return
+		}
+		if err := tx.QueryRow(ctx, `SELECT TRUE FROM materials WHERE id=$1 AND active=TRUE`, req.MaterialID).Scan(&ok); err != nil {
+			http.Error(w, "invalid material_id", http.StatusBadRequest)
+			return
+		}
+
+		// locația de unde a plecat (ultima mișcare CONSUM pe proiect+material)
+		fromLocationID := defaultStockLocationID // fallback ZOR
+		{
+			var fl pgtype.Int8
+			_ = tx.QueryRow(ctx, `
+				SELECT from_location_id
+				FROM stock_movements
+				WHERE project_id=$1 AND material_id=$2 AND type='CONSUM'
+				ORDER BY created_at DESC
+				LIMIT 1
+			`, req.ProjectID, req.MaterialID).Scan(&fl)
+
+			if fl.Valid && fl.Int64 > 0 {
+				fromLocationID = fl.Int64
+			}
+		}
+
+		// cât s-a consumat până acum pe lucrare (doar CONSUM)
+		currentQty := 0.0
+		{
+			var qn pgtype.Numeric
+			if err := tx.QueryRow(ctx, `
+				SELECT COALESCE(SUM(qty),0)
+				FROM stock_movements
+				WHERE project_id=$1 AND material_id=$2 AND type='CONSUM'
+			`, req.ProjectID, req.MaterialID).Scan(&qn); err != nil {
+				http.Error(w, "sum failed", http.StatusInternalServerError)
+				return
+			}
+			if qn.Valid {
+				if f, err := qn.Float64Value(); err == nil && f.Valid {
+					currentQty = f.Float64
+				}
+			}
+		}
+
+		// unit price snapshot (ca la /stock/consume)
+		unitPrice := req.UnitPrice
+		if unitPrice <= 0 {
+			var p pgtype.Numeric
+			err := tx.QueryRow(ctx, `SELECT price FROM materials WHERE id = $1 AND active = TRUE`, req.MaterialID).Scan(&p)
+			if err == nil && p.Valid {
+				if f, err2 := p.Float64Value(); err2 == nil && f.Valid {
+					unitPrice = f.Float64
+				}
+			}
+			// dacă rămâne 0 -> acceptăm (cost necunoscut), exact ca în /stock/consume
+		}
+
+		// 1) RETURN la tot ce era consumat (dacă există)
+		if currentQty > 0 {
+			_, err = tx.Exec(ctx, `
+				INSERT INTO stock_movements
+				(material_id, type, from_location_id, to_location_id, project_id, qty, unit_price_snapshot, created_by_user_id, note)
+				VALUES
+				($1, 'RETURN', NULL, $2, $3, $4, NULL, $5, NULLIF($6,''))
+			`, req.MaterialID, fromLocationID, req.ProjectID, currentQty, claims.UserID, req.Note)
+			if err != nil {
+				http.Error(w, "return insert failed", http.StatusBadRequest)
+				return
+			}
+		}
+
+		// 2) CONSUM pentru qty finală (dacă qty > 0)
+		if req.Qty > 0 {
+			available, err := getStockQty(ctx, tx, req.MaterialID, fromLocationID)
+			if err != nil {
+				http.Error(w, "stock check failed", http.StatusInternalServerError)
+				return
+			}
+			if available < req.Qty {
+				http.Error(w, "insufficient stock", http.StatusBadRequest)
+				return
+			}
+
+			_, err = tx.Exec(ctx, `
+				INSERT INTO stock_movements
+				(material_id, type, from_location_id, to_location_id, project_id, qty, unit_price_snapshot, created_by_user_id, note)
+				VALUES
+				($1, 'CONSUM', $2, NULL, $3, $4, NULLIF($5,0), $6, NULLIF($7,''))
+			`, req.MaterialID, fromLocationID, req.ProjectID, req.Qty, unitPrice, claims.UserID, req.Note)
+			if err != nil {
+				http.Error(w, "consume insert failed", http.StatusBadRequest)
+				return
+			}
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			http.Error(w, "commit failed", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":               true,
+			"project_id":       req.ProjectID,
+			"material_id":      req.MaterialID,
+			"from_location_id": fromLocationID,
+			"was_qty":          currentQty,
+			"now_qty":          req.Qty,
 		})
 	})))
 
