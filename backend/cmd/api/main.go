@@ -2793,16 +2793,48 @@ WHERE id = $1
 		// listăm consumurile (CONSUM) pe proiect, agregat pe material + preț snapshot
 		rows, err := db.Query(ctx, `
 	SELECT
-	m.id,
-	m.name,
-	m.unit,
-	sm.unit_price_snapshot,
-	SUM(sm.qty) AS qty,
-	SUM(sm.qty * COALESCE(sm.unit_price_snapshot, 0)) AS cost
+	  m.id,
+	  m.name,
+	  m.unit,
+	  COALESCE(
+		(
+		  SELECT sm2.unit_price_snapshot
+		  FROM stock_movements sm2
+		  WHERE sm2.project_id = $1
+			AND sm2.material_id = m.id
+			AND sm2.type = 'CONSUM'
+		  ORDER BY sm2.created_at DESC
+		  LIMIT 1
+		),
+		0
+	  ) AS unit_price_snapshot,
+	  SUM(
+		CASE
+		  WHEN sm.type = 'CONSUM' THEN sm.qty
+		  WHEN sm.type = 'RETURN' THEN -sm.qty
+		  ELSE 0
+		END
+	  ) AS qty,
+	  SUM(
+		CASE
+		  WHEN sm.type = 'CONSUM' THEN sm.qty * COALESCE(sm.unit_price_snapshot, 0)
+		  WHEN sm.type = 'RETURN' THEN -sm.qty * COALESCE(sm.unit_price_snapshot, 0)
+		  ELSE 0
+		END
+	  ) AS cost
 	FROM stock_movements sm
 	JOIN materials m ON m.id = sm.material_id
-	WHERE sm.project_id = $1 AND sm.type = 'CONSUM'
-	GROUP BY m.id, m.name, m.unit, sm.unit_price_snapshot
+	WHERE sm.project_id = $1
+	  AND sm.type IN ('CONSUM', 'RETURN')
+	GROUP BY m.id, m.name, m.unit
+	HAVING
+	  SUM(
+		CASE
+		  WHEN sm.type = 'CONSUM' THEN sm.qty
+		  WHEN sm.type = 'RETURN' THEN -sm.qty
+		  ELSE 0
+		END
+	  ) <> 0
 	ORDER BY m.name
 	`, projectID)
 		if err != nil {
@@ -3190,16 +3222,48 @@ WHERE id = $1
 
 		rows, err := db.Query(ctx, `
 	SELECT
-	m.id,
-	m.name,
-	m.unit,
-	sm.unit_price_snapshot,
-	SUM(sm.qty) AS qty,
-	SUM(sm.qty * COALESCE(sm.unit_price_snapshot, 0)) AS cost
+	  m.id,
+	  m.name,
+	  m.unit,
+	  COALESCE(
+		(
+		  SELECT sm2.unit_price_snapshot
+		  FROM stock_movements sm2
+		  WHERE sm2.project_id = $1
+			AND sm2.material_id = m.id
+			AND sm2.type = 'CONSUM'
+		  ORDER BY sm2.created_at DESC
+		  LIMIT 1
+		),
+		0
+	  ) AS unit_price_snapshot,
+	  SUM(
+		CASE
+		  WHEN sm.type = 'CONSUM' THEN sm.qty
+		  WHEN sm.type = 'RETURN' THEN -sm.qty
+		  ELSE 0
+		END
+	  ) AS qty,
+	  SUM(
+		CASE
+		  WHEN sm.type = 'CONSUM' THEN sm.qty * COALESCE(sm.unit_price_snapshot, 0)
+		  WHEN sm.type = 'RETURN' THEN -sm.qty * COALESCE(sm.unit_price_snapshot, 0)
+		  ELSE 0
+		END
+	  ) AS cost
 	FROM stock_movements sm
 	JOIN materials m ON m.id = sm.material_id
-	WHERE sm.project_id = $1 AND sm.type = 'CONSUM'
-	GROUP BY m.id, m.name, m.unit, sm.unit_price_snapshot
+	WHERE sm.project_id = $1
+	  AND sm.type IN ('CONSUM', 'RETURN')
+	GROUP BY m.id, m.name, m.unit
+	HAVING
+	  SUM(
+		CASE
+		  WHEN sm.type = 'CONSUM' THEN sm.qty
+		  WHEN sm.type = 'RETURN' THEN -sm.qty
+		  ELSE 0
+		END
+	  ) <> 0
 	ORDER BY m.name
 	`, projectID)
 		if err != nil {
