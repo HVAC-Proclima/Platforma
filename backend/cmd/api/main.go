@@ -2956,7 +2956,7 @@ WHERE id = $1
 		}
 
 		// unit price snapshot (ca la /stock/consume)
-		unitPrice := req.UnitPrice
+		unitPrice := req.UnitPriceSnapshot
 		if unitPrice <= 0 {
 			var p pgtype.Numeric
 			err := tx.QueryRow(ctx, `SELECT price FROM materials WHERE id = $1 AND active = TRUE`, req.MaterialID).Scan(&p)
