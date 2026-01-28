@@ -2611,14 +2611,6 @@ WHERE id = $1
 		}
 
 		sql += `
-	HAVING SUM(
-		CASE
-		WHEN sm.type IN ('IN','RETURN','TRANSFER') AND sm.to_location_id = l.id THEN sm.qty
-		WHEN sm.type IN ('CONSUM','TRANSFER') AND sm.from_location_id = l.id THEN -sm.qty
-		ELSE 0
-		END
-	) <> 0
-	ORDER BY m.name, l.name
 	LIMIT 2000
 	`
 
