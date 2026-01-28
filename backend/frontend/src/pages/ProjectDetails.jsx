@@ -1259,11 +1259,7 @@ export default function ProjectDetails() {
                   flash("err", "Cantitatea trebuie să fie > 0.")
                   return
                 }
-                const up = Number(editConsumeUnitPrice)
-                if (!up || up <= 0) {
-                  flash("err", "Prețul unitar trebuie să fie > 0.")
-                  return
-                }
+                const up = Number(editConsumeUnitPrice) || 0
                 const mid = Number(editConsumeItem?.material_id)
                 setMaterials((prev) => {
                   if (!prev) return prev
