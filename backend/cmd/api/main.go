@@ -2787,13 +2787,13 @@ WHERE id = $1
 	m.id,
 	m.name,
 	m.unit,
-	sm.unit_price_snapshot,
+	COALESCE(sm.unit_price_snapshot, m.price, 0) AS unit_price_snapshot,
 	SUM(sm.qty) AS qty,
-	SUM(sm.qty * COALESCE(sm.unit_price_snapshot, 0)) AS cost
+	SUM(sm.qty * COALESCE(sm.unit_price_snapshot, m.price, 0)) AS cost
 	FROM stock_movements sm
 	JOIN materials m ON m.id = sm.material_id
 	WHERE sm.project_id = $1 AND sm.type = 'CONSUM'
-	GROUP BY m.id, m.name, m.unit, sm.unit_price_snapshot
+	GROUP BY m.id, m.name, m.unit, COALESCE(sm.unit_price_snapshot, m.price, 0)
 	ORDER BY m.name
 	`, projectID)
 		if err != nil {
